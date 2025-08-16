@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 import os
 from typing import List
 
@@ -162,7 +160,7 @@ def test_chunk_varlen(
     ref, ref_ht = chunk_gated_delta_product_ref(
         q=q.clone(),
         k=k.clone(),
-        v=v.clone(),
+        v=v.clone( ),
         beta=beta.clone(),
         g=g.clone(),
         scale=scale,
@@ -210,3 +208,81 @@ def test_chunk_varlen(
     assert_close('db', ref_dbeta, tri_dbeta, 0.015)
     assert_close('dg', ref_dg, tri_dg, 0.015)
     assert_close('dh0', ref_dh0, tri_dh0, 0.007)
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'D', 'scale', 'num_householder', 'dtype'),
+    [
+        (1, 8, 2, 16, 0.1, 1, torch.float32),
+        (2, 12, 2, 24, 0.5, 2, torch.float32),
+    ]
+)
+def test_naive_vs_manual_backward(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    num_householder: int,
+    dtype: torch.dtype,
+):
+    """Test manual naive backward implementation against autograd."""
+    from fla.ops.gated_delta_product.naive import naive_torch_delta_product_bwd
+    
+    torch.manual_seed(42)
+    
+    # Create inputs
+    q = torch.randn(B, T, H, D, dtype=dtype, requires_grad=True)
+    k = torch.randn(B, T * num_householder, H, D, dtype=dtype, requires_grad=True)
+    v = torch.randn(B, T * num_householder, H, D, dtype=dtype, requires_grad=True)
+    beta = torch.rand(B, T * num_householder, H, dtype=dtype, requires_grad=True).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=dtype, requires_grad=True))
+    h0 = torch.randn(B, H, D, D, dtype=dtype, requires_grad=True)
+    
+    # Forward pass with autograd
+    o_auto, h_auto = naive_recurrent_gated_delta_product(
+        q=q, k=k, v=v, g=g, beta=beta,
+        scale=1.0, # scale is not used in naive_recurrent_gated_delta_product 
+        cu_seqlens=None,
+        initial_state=h0,
+        output_final_state=True, num_householder=num_householder
+    )
+    
+    do = torch.randn_like(o_auto)
+    dht = torch.randn_like(h_auto)
+    
+    # Compute gradients with autograd
+    ((o_auto * do).sum() + (h_auto * dht).sum()).backward()
+    auto_dq, auto_dk, auto_dv, auto_dbeta, auto_dg, auto_dh0 = q.grad, k.grad, v.grad, beta.grad, g.grad, h0.grad
+    
+    # Clear gradients and detach inputs for manual backward
+    q.grad = k.grad = v.grad = beta.grad = g.grad = h0.grad = None
+    q_manual = q.detach().clone()
+    k_manual = k.detach().clone()
+    v_manual = v.detach().clone()
+    beta_manual = beta.detach().clone()
+    g_manual = g.detach().clone()
+    h0_manual = h0.detach().clone()
+    
+    # Manual backward pass
+    manual_dq, manual_dk, manual_dv, manual_dg, manual_dbeta, manual_dh0 = naive_torch_delta_product_bwd(
+        q=q_manual,
+        k=k_manual,
+        v=v_manual,
+        g=g_manual,
+        beta=beta_manual,
+        scale=1.0, # scale is not used in naive_recurrent_gated_delta_product 
+        initial_state=h0_manual,
+        output_final_state=True,
+        num_householder=num_householder,
+        do=do,
+        dht=dht,
+    )
+    
+    # Compare gradients using same tolerances as existing tests
+    assert_close('dq', auto_dq, manual_dq, 0.008)
+    assert_close('dk', auto_dk, manual_dk, 0.008)
+    assert_close('dv', auto_dv, manual_dv, 0.008)
+    assert_close('db', auto_dbeta, manual_dbeta, 0.02)
+    assert_close('dg', auto_dg, manual_dg, 0.02)
+    assert_close('dh0', auto_dh0, manual_dh0, 0.008)
