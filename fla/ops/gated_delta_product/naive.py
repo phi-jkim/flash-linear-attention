@@ -70,10 +70,16 @@ def helper_direct_gradient_u_minus_ws(q, k, do, num_householder):
     Returns:
         Gradient tensor of shape (B, T_expanded, H, V)
     """
+    print(f"[HELPER1] helper_direct_gradient_u_minus_ws called")
+    print(f"[HELPER1] Input shapes: q={q.shape}, k={k.shape}, do={do.shape}")
+    print(f"[HELPER1] num_householder={num_householder}")
+    
     B, T_true, H, K = q.shape
     T_expanded = k.shape[1]
     assert(T_true * num_householder == T_expanded)
     V = do.shape[-1]
+    
+    print(f"[HELPER1] Computed: B={B}, T_true={T_true}, T_expanded={T_expanded}, H={H}, K={K}, V={V}")
     
     # Initialize output gradient
     du_direct = torch.zeros(B, T_expanded, H, V, device=q.device, dtype=q.dtype)
@@ -152,6 +158,10 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
     Returns:
         Tuple of (du_final, ds_final) gradients
     """
+    print(f"[HELPER2] helper_final_gradient_s_and_u called")
+    print(f"[HELPER2] Input shapes: q={q.shape}, k={k.shape}, w={w.shape}")
+    print(f"[HELPER2] du_direct={du_direct.shape}, do={do.shape}, ds_next={ds_next.shape}")
+    print(f"[HELPER2] g={g.shape}, g_expanded={g_expanded.shape}")
 
     ''' 
     returns derivative of non gated S 
@@ -160,6 +170,8 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
     B, T_true, H, K = q.shape
     T_expanded = k.shape[1]
     V = do.shape[-1]
+    
+    print(f"[HELPER2] Computed: B={B}, T_true={T_true}, T_expanded={T_expanded}, H={H}, K={K}, V={V}")
 
     # Initialize outputs
     du_final = torch.zeros_like(du_direct) 
@@ -305,9 +317,17 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
     Returns:
         Tuple of (dq, dw, dk, dg) gradients
     """
+    print(f"[HELPER3] helper_gradient_qwkg called")
+    print(f"[HELPER3] Input shapes: q={q.shape}, k={k.shape}, v_new={v_new.shape}")
+    print(f"[HELPER3] w={w.shape}, g={g.shape}, s={s.shape}")
+    print(f"[HELPER3] ds_final={ds_final.shape}, dht={dht.shape}, do={do.shape}")
+    print(f"[HELPER3] du_final={du_final.shape}, g_expanded={g_expanded.shape}")
+    
     B, T_true, H, K = q.shape
     T_expanded = k.shape[1]
     V = do.shape[-1]
+    
+    print(f"[HELPER3] Computed: B={B}, T_true={T_true}, T_expanded={T_expanded}, H={H}, K={K}, V={V}")
     
     # Mark unused variable
     _ = V
@@ -554,6 +574,12 @@ def helper_hidden_gradient_kvgb(k, g_expanded, v, beta, dk_direct, dg_expanded_d
     Returns:
         Tuple of (dk_final, dg_final, dv_final, dbeta_final) gradients
     """
+    print(f"[HELPER4] helper_hidden_gradient_kvgb called")
+    print(f"[HELPER4] Input shapes: k={k.shape}, g_expanded={g_expanded.shape}")
+    print(f"[HELPER4] v={v.shape}, beta={beta.shape}")
+    print(f"[HELPER4] dk_direct={dk_direct.shape}, dg_expanded_direct={dg_expanded_direct.shape}")
+    print(f"[HELPER4] dw={dw.shape}, du={du.shape}, A={A.shape}")
+    
     from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd
     
     # Call WY representation backward - following chunk_gated_delta_rule_bwd pattern
@@ -616,9 +642,17 @@ def gated_naive_torch_delta_product_bwd(
     """
     Main delta product backward function using the 4 helper functions.
     """
+    print(f"[MAIN_BWD] gated_naive_torch_delta_product_bwd called")
+    print(f"[MAIN_BWD] Input shapes: q={q.shape}, k={k.shape}, v={v.shape}")
+    print(f"[MAIN_BWD] g={g.shape if g is not None else None}, beta={beta.shape}")
+    print(f"[MAIN_BWD] do={do.shape if do is not None else None}, dht={dht.shape if dht is not None else None}")
+    print(f"[MAIN_BWD] scale={scale}, num_householder={num_householder}")
+    
     B, T_true, H, K = q.shape
     T_expanded = k.shape[1]
     V = v.shape[-1]
+    
+    print(f"[MAIN_BWD] Computed: B={B}, T_true={T_true}, T_expanded={T_expanded}, H={H}, K={K}, V={V}")
     
     # Use scale and output_final_state if needed
     _ = scale, output_final_state, T_true, K, V

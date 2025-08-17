@@ -273,12 +273,12 @@ def test_naive_vs_manual_backward(
     
     # Clear gradients and detach inputs for manual backward
     q.grad = k.grad = v.grad = beta.grad = g.grad = h0.grad = None
-    q_manual = q.detach().clone()
-    k_manual = k.detach().clone()
-    v_manual = v.detach().clone()
-    beta_manual = beta.detach().clone()
-    g_manual = g.detach().clone()
-    h0_manual = h0.detach().clone()
+    q_manual = q.clone()
+    k_manual = k.clone()
+    v_manual = v.clone()
+    beta_manual = beta.clone()
+    g_manual = g.clone()
+    h0_manual = h0.clone()
     
     # Manual backward pass
     manual_dq, manual_dk, manual_dv, manual_dg, manual_dbeta, manual_dh0 = naive_torch_delta_product_bwd(
