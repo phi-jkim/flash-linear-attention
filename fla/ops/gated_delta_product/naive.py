@@ -3,14 +3,15 @@ import math
 from typing import Optional
 
 # Import required functions for backward pass
-from fla.ops.common.chunk_delta_h import chunk_local_cumsum
 from fla.ops.gated_delta_rule.wy_fast import (
-    gdn_recompute_w_u_fwd,
-    dn_recompute_w_u_fwd,
-    chunk_scaled_dot_kkt_fwd,
-    solve_tril,
-    chunk_gated_delta_rule_fwd_h
+    recompute_w_u_fwd as gdn_recompute_w_u_fwd,
 )
+
+from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from fla.ops.delta_rule.wy_fast import recompute_w_u_fwd as dn_recompute_w_u_fwd
+
+from fla.ops.utils import chunk_local_cumsum, solve_tril
+from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 
 
 def naive_recurrent_gated_delta_product(q, k, v, g, beta, scale, cu_seqlens,
@@ -110,7 +111,7 @@ def helper_direct_gradient_u_minus_ws(q, k, do, num_householder):
         k_chunk = k[:, expanded_t_start:expanded_t_end]           # (B, chunk_size, H, K)
         do_chunk = do[:, t_start:t_end] # (B, chunk_size, H, V)
 
-        # TODO chec kthat q_chunk and k_chunk have same dimensions 
+        # TODO chec kthat q_chunk and k_chunk have same dimensions (can have different chunk dimensions other than dk)
 
         # TODO implement iterating over separating DK as well 
         
@@ -151,6 +152,11 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
     Returns:
         Tuple of (du_final, ds_final) gradients
     """
+
+    ''' 
+    returns derivative of non gated S 
+    '''
+
     B, T_true, H, K = q.shape
     T_expanded = k.shape[1]
     V = do.shape[-1]
@@ -166,6 +172,7 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
     # Process chunks sequentially from T_true to 1 (backward pass) - iterate over T_true as per PDF
     BT_expanded = 64 
     BT_true = 64  # Chunk size for true time dimension 
+    assert(BT_expanded == BT_true) 
     num_chunks = math.ceil(T_true / BT_true)
 
     ds_final = torch.zeros(B, num_chunks, H, K, V, device=q.device, dtype=torch.float32) 
@@ -209,9 +216,11 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
                 continue
             
             # Extract K block
-            # TODO use k that has been gated 
             k_chunk = k[:, k_t_start:k_t_end]
-            gated_k_chunk = k_chunk * (g_expanded[:, k_t_end-1, :] - g_expanded[:, k_t_start:k_t_end, :]).exp()
+            # Apply gating: exp(g_expanded[t+N-1] - g_expanded[t:t+N])
+            g_last = g_expanded[:, expanded_end-1, :, None]  # (B, 1, H, 1)
+            g_current = g_expanded[:, k_t_start:k_t_end, :, None]  # (B, k_block_size, H, 1)
+            gated_k_chunk = k_chunk * torch.exp(g_last - g_current)
             k_block = gated_k_chunk  # (B, k_block_size, H, K)
 
             # TODO can divide dk and dv into blocks 
@@ -265,17 +274,17 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
         # Store prev_ds in ds_final for this chunk  
         # TODO check 
         # ds_final is (B, num_chunks, H, K, V) each state corresponds to BT * num_householder tokens 
-        ds_final[:, chunk_idx, :, :, :] = chunk_ds
+        ds_final[:, chunk_idx, :, :, :] = chunk_ds.clone()
         
         # Update prev_ds for next iteration
         # update S_{t+1} as S_{t}
-        prev_ds = chunk_ds  
+        prev_ds = chunk_ds.clone()  
     
     return du_final, ds_final
 
 
 # Helper Function 3: Final gradient computation for Q[t], W[t] and direct gradient for K[t], g[t] (PDF Section 3)  
-def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, do, du_final, 
+def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final, 
                         g_expanded, num_householder):
     """
     Compute gradients for Q, W, K, g following PDF Section 3.
@@ -300,11 +309,15 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, do, du_final,
     T_expanded = k.shape[1]
     V = do.shape[-1]
     
+    # Mark unused variable
+    _ = V
+    
     # Initialize gradients
     dq = torch.zeros_like(q)
     dw = torch.zeros_like(w) 
     dk = torch.zeros_like(k)
     dg = torch.zeros_like(g) 
+    dg_expanded = torch.zeros(B, T_expanded, H, device=g.device, dtype=g.dtype)
     
     # Chunking parameters (following helper_final_gradient_s_and_u pattern)
     BT_true = 64  # Same block size for both true and expanded sequences
@@ -319,7 +332,6 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, do, du_final,
     causal_mask = expanded_causal_mask[num_householder-1::num_householder, :] # (T_true, T_expanded)
     assert(causal_mask.shape == (T_true, T_expanded)) 
 
-    dg_expanded = torch.zeros(B, T_expanded, H, device=g.device, dtype=g.dtype)
     
     for chunk_idx in range(num_chunks):
         # True sequence indices
@@ -338,24 +350,33 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, do, du_final,
         # Extract chunks
         q_chunk = q[:, q_t_start:q_t_end]  # (B, q_chunk_size, H, K)
         do_chunk = do[:, q_t_start:q_t_end]  # (B, q_chunk_size, H, V)
-        du_chunk = du_final[:, expanded_start:expanded_end]  # (B, expanded_chunk_size, H, V)
 
+        du_chunk = du_final[:, expanded_start:expanded_end]  # (B, expanded_chunk_size, H, V)
         k_chunk = k[:, expanded_start:expanded_end]  # (B, expanded_chunk_size, H, K)
         w_chunk = w[:, expanded_start:expanded_end]
         
         # Extract state gradients for this chunk
+        # s_next is not needed 
         s_chunk = s[:, chunk_idx]  # s is (B, num_chunks, H, K, V)
-        gated_s_chunk = s_chunk * g_expanded[:, expanded_end-1, None].exp()
+        gated_s_chunk = s_chunk * g_expanded[:, expanded_end-1, :, None, None].exp()
+        
+        # Mark unused variables to avoid warnings
+        _ = k_chunk, w_chunk
+
+        # ds_chunk_next can be dht 
         ds_chunk = ds_final[:, chunk_idx]  # (B, H, K, V) 
         if chunk_idx + 1 < num_chunks:
             ds_chunk_next = ds_final[:, chunk_idx + 1]  # (B, H, K, V)
         else: 
-            ds_chunk_next = torch.zeros(B, H, K, V, device=q.device, dtype=q.dtype)
+            # ds_chunk_next is the next state gradient 
+            ds_chunk_next = dht 
 
+        # TODO need to also account for b_dg_last of b dh 
         # add to dg_expanded
         # S[t] = 1/exp(g[t+N-1]) * \arrow{S}[t]
         # dL/d g[t+N-1] = dL/dS[t] * \arrow{S}[t] * (- 1/exp(g[t+N-1]))  
-        dg_expanded[:, expanded_end-1, :] += ds_chunk * gated_s_chunk * - (1/g_expanded[:, expanded_end-1, None].exp())
+        # (B,H,K,V) -> (B,H) by summing dim 2 and 3 
+        dg_expanded[:, expanded_end-1, :] += (ds_chunk * gated_s_chunk * - (1/g_expanded[:, expanded_end-1, :, None].exp())).sum(dim=(2,3))
         
         # Compute dQ_arrow following PDF Section 3
         # Term 1: (∂/∂O @ S[t]) ⊙ γ' - using ds_final as state gradients
@@ -390,9 +411,9 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, do, du_final,
                     v_new_block = v_new[:, v_new_t_start:v_new_t_end] 
                     
                     # computing A = dO * dvnew^T \cdot M 
-                    dA = torch.mm(do_chunk[b, :, h], v_new_block[b, :, h].t()) * causal_mask_chunk.unsqueeze(-1) 
-                    # block sum with BT \times BT and BT \times dk blocks multiplied by 1/g[t:t+N] (to compute dq_arrow)
-                    dq_arrow += (dA @ k_chunk[b, v_new_t_start:v_new_t_end, h]) * (1/g[b, q_t_start:q_t_end, h, None].exp())
+                    dA = torch.mm(do_chunk[b, :, h], v_new_block[b, :, h].t()) * causal_mask_chunk
+                    # block sum with BT \times BT and BT \times dk blocks multiplied by exp(-g[t:t+N]) (to compute dq_arrow)
+                    dq_arrow += (dA @ k[b, v_new_t_start:v_new_t_end, h]) * torch.exp(-g[b, q_t_start:q_t_end, h])[:, None]
                 
                 dq[b, q_t_start:q_t_end, h] = dq_arrow
         
@@ -402,30 +423,25 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, do, du_final,
                 # Block matrix multiply du_final with state gradients
                 # du_chunk: (expanded_chunk_size, V), ds_chunk: (K, V)
                 # ds_chunk^T: (V, K) -> result: (expanded_chunk_size, K)
+                # TODO need to batch and parallelize 
                 dw_arrow = -torch.mm(du_chunk[b, :, h], ds_chunk[b, h].t())  # (expanded_chunk_size, K)
                 
                 dw[b, expanded_start:expanded_end, h] += dw_arrow
         
         # Compute d\overrightarrow{K} following PDF Section 3  
         # Term 1: A × ∂/∂S[t+1] (using ds_final)
-        # Term 2: Attention gradient term 
+        # Term 2: Attention gradient term and computing d\overrightarrow{K} from dK
         for b in range(B):
             for h in range(H):
                 dk_arrow = torch.zeros(expanded_end - expanded_start, K, device=q.device)
                 
                 # Term 1: (Ũ - WS^T) × ∂/∂S[t+1] 
                 # du_chunk represents (Ũ - WS^T): (expanded_chunk_size, V)
-                # ds_chunk represents next ds ∂/∂S[t+1]: (K, V) if it exists and otherwise 0 
-                # TODO: incorect need to compute gradient from next s term 
+                # ds_chunk represents next ds ∂/∂S[t+1]: (K, V) if it exists and otherwise dht (last state gradient provided to bwd)
+                # TODO: need to separate into block multiplication
                 term1_contrib = torch.mm(du_chunk[b, :, h], ds_chunk_next[b, h].t())  # (expanded_chunk_size, K)
                 
-                # Apply gamma scaling: γ'[t+N-1]/γ'[t:t+N]
-                # g_expanded_chunk = g_expanded[b, expanded_start:expanded_end, h]
-                # term1_contrib = term1_contrib * (g_expanded_chunk[-1] / g_expanded_chunk.unsqueeze(-1))
-                
                 dk_arrow += term1_contrib
-
-                assert(BT_expanded == BT_true)
 
                 # TODO replace BT_expanded with BT_true 
 
@@ -448,7 +464,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, do, du_final,
                     v_new_block_T = v_new_block[b, :, h].t()  # v_new^T: (dV, v_new_block_size) 
 
                     # computing A = dO * dvnew^T \cdot M as blocks (BT \times BV @ BV \times BT -> BT \times BT)
-                    dA = torch.mm(do_chunk[b, :, h], v_new_block_T.t()) * causal_mask_chunk.unsqueeze(-1)  # (q_chunk_size, v_new_block_size)
+                    dA = torch.mm(do_chunk[b, :, h], v_new_block_T.t()) * causal_mask_chunk  # (q_chunk_size, v_new_block_size)
                     
                     # Final: (dA)^T × Q' -> (v_new_block_size, K)
                     term2_block = torch.mm(dA.t(), q_chunk[b, :, h])  # (BT_expanded, K)
@@ -457,16 +473,14 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, do, du_final,
                     # store in appropriate index of dk_arrow 
                     # and divide the gated term to compute derivative of dk_arrow from dk 
                     # TODO check if correct
-                    dk_arrow[v_new_t_start:v_new_t_end] += term2_block * (g_expanded[b, v_new_t_start:v_new_t_end, h] - g_expanded[b, expanded_end - 1, h]).exp()
+                    dk_arrow[v_new_t_start-expanded_start:v_new_t_end-expanded_start] += term2_block * (g_expanded[b, v_new_t_start:v_new_t_end, h] - g_expanded[b, expanded_end - 1, h]).exp()[:, None]
                 
                 dk[b, expanded_start:expanded_end, h] = dk_arrow
 
-    # TODO need to also account for b_dg_last of b dh 
-
     # TODO double check the dg implementation 
 
-    # g_1, g_2, \cdots g_r are cumulative 
-
+    # convert the gradients of the overrightarrow{q}, overrightarrow{w}, overrightarrow{k} to gradients of 
+    # q, w, k 
     for chunk_idx in range(num_chunks):
         # converting from gated output derivatives to input derivatives by chain rule 
         # doing chain rule on q_rightarrow [i, :] = q [i, :] * exp(g) * scale 
@@ -476,17 +490,18 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, do, du_final,
         q_t_end = min(q_t_start + BT_true, T_true)
 
         expanded_start = q_t_start * num_householder
-        expanded_end = min(q_t_end * num_householder, expanded_size)
+        expanded_end = min(q_t_end * num_householder, T_expanded)
         expanded_size = expanded_end - expanded_start
 
-        # TODO move to inside for loop of b and h 
-        dg[:, q_t_start:q_t_end, :] = (dq[:, q_t_start:q_t_end, :] * q[:, q_t_start:q_t_end, :] * scale).sum(dim=1) * torch.exp(g[:, q_t_start:q_t_end, :]) # reduce the second dimension or sum each rows 
-        dq[:, q_t_start:q_t_end, :] = dq[:, q_t_start:q_t_end, :] * torch.exp(g[:, q_t_start:q_t_end, :])[:, None] * scale 
-        
         num_blocks = math.ceil(expanded_size / BT_expanded) 
 
         for b in range(B):
             for h in range(H):
+                # Compute dg first before modifying dq
+                # add over dim = 1 or add over rows because the ith row of q is scaled by a fixed g[i], so we need to sum over gradients of g[i] over each row 
+                dg[b, q_t_start:q_t_end, h] += (dq[b, q_t_start:q_t_end, h] * q[b, q_t_start:q_t_end, h]).sum(dim=1) * torch.exp(g[b, q_t_start:q_t_end, h]) # reduce the second dimension or sum each rows 
+                dq[b, q_t_start:q_t_end, h] = dq[b, q_t_start:q_t_end, h] * torch.exp(g[b, q_t_start:q_t_end, h])[:, None] 
+                
                 for block_idx in range(num_blocks):
                     block_start = expanded_start + block_idx * BT_expanded
                     block_end = min(block_start + BT_expanded, expanded_end)
@@ -498,11 +513,14 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, do, du_final,
                 g_expanded_current_block = g_expanded[b, block_start:block_end, h]
                 g_expanded_last = g_expanded[b, expanded_end - 1, h]
 
-                dg_expanded[b, block_start:block_end, h] += (dw[b, block_start:block_end, h] * w[b, block_start:block_end, h] * scale).sum(dim=1) * g_expanded_current_block.exp()
-                dw[b, block_start:block_end, h] = dw[b, block_start:block_end, h] * torch.exp(g_expanded_current_block)[:, None] * scale 
+                dg_expanded[b, block_start:block_end, h] += (dw[b, block_start:block_end, h] * w[b, block_start:block_end, h]).sum(dim=1) * g_expanded_current_block.exp()
+                dw[b, block_start:block_end, h] = dw[b, block_start:block_end, h] * torch.exp(g_expanded_current_block)[:, None]
 
                 # check gradient of last dg element 
-                dg_expanded[b, block_end-1, h] += ((dk[b, block_start:block_end, h] * k[b, block_start:block_end, h]).sum(dim=1) * torch.exp(-g_expanded_current_block + g_expanded_last)).sum(dim=1)
+                # expanded_end does not have to be q_t_end * num_householder but it corresponds to last expanded otken of 
+                # the expanded chunk 
+                if block_end > 0:
+                    dg_expanded[b, block_end-1, h] += ((dk[b, block_start:block_end, h] * k[b, block_start:block_end, h]).sum(dim=1) * torch.exp(-g_expanded_current_block + g_expanded_last)).sum()
                 dg_expanded[b, block_start:block_end, h] += (dk[b, block_start:block_end, h] * k[b, block_start:block_end, h]).sum(dim=1) * - torch.exp(-g_expanded_current_block + g_expanded_last)
 
                 # multiply the gamma term of e^(gamma_[t+N-1] - gamma[t:t+N])
@@ -516,7 +534,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, do, du_final,
 
 
 # Helper Function 4: Hidden gradient computation for K[t], g, V[t], β[t] (PDF Section 4)
-def helper_hidden_gradient_kvgb(k, g_expanded, v, beta, dk_direct, dg_expanded_direct, dw, du, A, num_householder):
+def helper_hidden_gradient_kvgb(k, g_expanded, v, beta, dk_direct, dg_expanded_direct, dw, du, A):
     """
     Compute hidden gradients for K, g, V, β following PDF Section 4.
     Calls prepare_wy_repr_bwd and accumulates gradients as in chunk_gated_delta_rule_bwd.
@@ -568,17 +586,47 @@ def naive_torch_delta_product_bwd(
     dht: Optional[torch.Tensor] = None,
 ) -> tuple:
     """
+    Naive backward function that matches the test interface.
+    Returns gradients in the order expected by the test: (dq, dk, dv, dg, dbeta, dh0)
+    """
+    dq, dk_final, dv_final, dg_final, dbeta_final, ds0 = gated_naive_torch_delta_product_bwd(
+        q, k, v, g, beta, scale, initial_state, output_final_state, 
+        num_householder, do, dht
+    )
+    
+    # Convert dg_final from expanded format back to true format for the test
+    dg_true = dg_final[:, ::num_householder, :]
+    
+    return dq, dk_final, dv_final, dg_true, dbeta_final, ds0
+
+
+def gated_naive_torch_delta_product_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: Optional[torch.Tensor],
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    num_householder: int = 1,
+    do: Optional[torch.Tensor] = None,
+    dht: Optional[torch.Tensor] = None,
+) -> tuple:
+    """
     Main delta product backward function using the 4 helper functions.
     """
     B, T_true, H, K = q.shape
     T_expanded = k.shape[1]
     V = v.shape[-1]
     
+    # Use scale and output_final_state if needed
+    _ = scale, output_final_state, T_true, K, V
+    
     # Setup interleaved g for gamma computation
-    g_expanded = None
-    if g is not None:
-        g_expanded = torch.zeros(B, T_expanded, H, device=g.device, dtype=torch.float32)
-        g_expanded[:, ::num_householder, :] = g
+    assert(g is not None)
+    g_expanded = torch.zeros(B, T_expanded, H, device=g.device, dtype=torch.float32)
+    g_expanded[:, ::num_householder, :] = g
 
     g = chunk_local_cumsum(g, chunk_size=64)
     g_expanded = chunk_local_cumsum(g_expanded, chunk_size=64)
@@ -632,13 +680,15 @@ def naive_torch_delta_product_bwd(
     
     # Step 3: Compute Q, W, K, G gradients using Helper Function 3
     # TODO check how scale is used 
-    dq, dw, dk_direct, dg_direct = helper_gradient_qwkg(
-        q, k, v_new, w, g, h, ds_final, do, du_final, g_expanded, num_householder, scale
+    dq, dw, dk_direct, dg_expanded_direct = helper_gradient_qwkg(
+        q, k, v_new, w, g, h, ds_final, dht, do, du_final, g_expanded, num_householder
     )
+
+    # g is gradients over expanded tokens 
     
     # Step 4: Compute hidden gradients using Helper Function 4 and add to direct gradients of dk and dg 
     dk_final, dg_final, dv_final, dbeta_final = helper_hidden_gradient_kvgb(
-        k, g_expanded, v, beta, dk_direct, dg_direct, dw, du_final, A, num_householder
+        k, g_expanded, v, beta, dk_direct, dg_expanded_direct, dw, du_final, A
     )
 
     assert dg_final.dtype == torch.float32, "dg should be fp32"
@@ -647,7 +697,7 @@ def naive_torch_delta_product_bwd(
     ds0 = ds_final[:, 0]
     # only the first hidden state gradient needs to be returned ds0 for computing gradient of previous chunk 
     
-    # not returning dh0 yet 
+    # Return in the expected order: (dq, dk, dv, dg, dbeta, dh0)
     return dq, dk_final, dv_final, dg_final, dbeta_final, ds0 
 
 
