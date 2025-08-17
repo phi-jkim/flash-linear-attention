@@ -235,20 +235,25 @@ def test_naive_vs_manual_backward(
     """Test manual naive backward implementation against autograd."""
     from fla.ops.gated_delta_product.naive import naive_torch_delta_product_bwd
     
+    print(f"\n=== Testing B={B}, T={T}, H={H}, D={D}, scale={scale}, num_householder={num_householder}, dtype={dtype} ===")
+    
     torch.manual_seed(42)
     
-    # Create inputs
-    q = torch.randn(B, T, H, D, dtype=dtype, requires_grad=True)
-    k = torch.randn(B, T * num_householder, H, D, dtype=dtype, requires_grad=True)
-    v = torch.randn(B, T * num_householder, H, D, dtype=dtype, requires_grad=True)
-    beta = torch.rand(B, T * num_householder, H, dtype=dtype, requires_grad=True).sigmoid()
-    g = F.logsigmoid(torch.rand(B, T, H, dtype=dtype, requires_grad=True))
-    h0 = torch.randn(B, H, D, D, dtype=dtype, requires_grad=True)
+    # Create inputs on the correct device
+    print(f"Creating tensors on device: {device}")
+    q = torch.randn(B, T, H, D, dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
+    beta = torch.rand(B, T * num_householder, H, dtype=dtype, device=device, requires_grad=True).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=dtype, device=device, requires_grad=True))
+    h0 = torch.randn(B, H, D, D, dtype=dtype, device=device, requires_grad=True)
+    
+    print(f"Input shapes: q={q.shape}, k={k.shape}, v={v.shape}, beta={beta.shape}, g={g.shape}, h0={h0.shape}")
     
     # Forward pass with autograd
     o_auto, h_auto = naive_recurrent_gated_delta_product(
         q=q, k=k, v=v, g=g, beta=beta,
-        scale=1.0, # scale is not used in naive_recurrent_gated_delta_product 
+        scale=scale,
         cu_seqlens=None,
         initial_state=h0,
         output_final_state=True, num_householder=num_householder
@@ -257,8 +262,13 @@ def test_naive_vs_manual_backward(
     do = torch.randn_like(o_auto)
     dht = torch.randn_like(h_auto)
     
+    # Ensure outputs retain gradients for proper backward computation
+    o_auto.retain_grad()
+    h_auto.retain_grad()
+    
     # Compute gradients with autograd
-    ((o_auto * do).sum() + (h_auto * dht).sum()).backward()
+    loss = (o_auto * do).sum() + (h_auto * dht).sum()
+    loss.backward()
     auto_dq, auto_dk, auto_dv, auto_dbeta, auto_dg, auto_dh0 = q.grad, k.grad, v.grad, beta.grad, g.grad, h0.grad
     
     # Clear gradients and detach inputs for manual backward
@@ -277,7 +287,7 @@ def test_naive_vs_manual_backward(
         v=v_manual,
         g=g_manual,
         beta=beta_manual,
-        scale=1.0, # scale is not used in naive_recurrent_gated_delta_product 
+        scale=scale,
         initial_state=h0_manual,
         output_final_state=True,
         num_householder=num_householder,
