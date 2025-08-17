@@ -215,6 +215,12 @@ def test_chunk_varlen(
     [
         (1, 8, 2, 16, 0.1, 1, torch.float32),
         (2, 12, 2, 24, 0.5, 2, torch.float32),
+        (1, 64, 2, 32, 0.1, 1, torch.float32),
+        (2, 128, 4, 64, 0.5, 2, torch.float32),
+        (1, 256, 4, 64, 1.0, 2, torch.float32),
+        (2, 512, 8, 128, 0.1, 3, torch.float32),
+        (1, 1024, 8, 128, 1.0, 3, torch.float32),
+        (2, 2048, 4, 64, 0.5, 2, torch.float32),
     ]
 )
 def test_naive_vs_manual_backward(
