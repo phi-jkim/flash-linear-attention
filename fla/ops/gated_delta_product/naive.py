@@ -76,7 +76,7 @@ def helper_direct_gradient_u_minus_ws(q, k, do, num_householder):
     V = do.shape[-1]
     
     # Initialize output gradient
-    du_direct = torch.zeros(B, T_expanded, H, V, device=q.device, dtype=torch.float32)
+    du_direct = torch.zeros(B, T_expanded, H, V, device=q.device, dtype=q.dtype)
     
     # Apply gamma scaling to Q and dO
     # if gamma_expanded is not None:
@@ -175,7 +175,7 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
     assert(BT_expanded == BT_true) 
     num_chunks = math.ceil(T_true / BT_true)
 
-    ds_final = torch.zeros(B, num_chunks, H, K, V, device=q.device, dtype=torch.float32) 
+    ds_final = torch.zeros(B, num_chunks, H, K, V, device=q.device, dtype=q.dtype) 
     # prev_ds = ds_next.clone() 
     # prev_ds = torch.zeros(B, H, K, V, device=q.device, dtype=torch.float32)
     prev_ds = ds_next.clone()
@@ -625,7 +625,7 @@ def gated_naive_torch_delta_product_bwd(
     
     # Setup interleaved g for gamma computation
     assert(g is not None)
-    g_expanded = torch.zeros(B, T_expanded, H, device=g.device, dtype=torch.float32)
+    g_expanded = torch.zeros(B, T_expanded, H, device=g.device, dtype=g.dtype)
     g_expanded[:, ::num_householder, :] = g
 
     g = chunk_local_cumsum(g, chunk_size=64)
@@ -636,7 +636,7 @@ def gated_naive_torch_delta_product_bwd(
         k=k,
         g=g_expanded,
         beta=beta,
-        output_dtype=torch.float32
+        output_dtype=g.dtype
     )
     A = solve_tril(
         A=A,
@@ -691,7 +691,7 @@ def gated_naive_torch_delta_product_bwd(
         k, g_expanded, v, beta, dk_direct, dg_expanded_direct, dw, du_final, A
     )
 
-    assert dg_final.dtype == torch.float32, "dg should be fp32"
+    # assert dg_final.dtype == torch.float32, "dg should be fp32"
     dg_final = chunk_local_cumsum(dg_final, chunk_size=64, reverse=True)
 
     ds0 = ds_final[:, 0]
