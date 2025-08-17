@@ -135,15 +135,21 @@ def helper_direct_gradient_u_minus_ws(q, k, do, num_householder):
         for b in range(B):
             for h in range(H):
                 # QK^T: (chunk_size, K) @ (K, chunk_size) -> (chunk_size, chunk_size)
+                print(f"[HELPER1] q_chunk[{b}, :, {h}] values: min={q_chunk[b, :, h].min():.6f}, max={q_chunk[b, :, h].max():.6f}, has_nan={torch.isnan(q_chunk[b, :, h]).any()}")
+                print(f"[HELPER1] k_chunk[{b}, :, {h}] values: min={k_chunk[b, :, h].min():.6f}, max={k_chunk[b, :, h].max():.6f}, has_nan={torch.isnan(k_chunk[b, :, h]).any()}")
                 qk = torch.mm(q_chunk[b, :, h], k_chunk[b, :, h].t())
                 print(f"[HELPER1] Computed QK^T with shape {qk.shape} for batch {b}, head {h}")
+                print(f"[HELPER1] qk values: min={qk.min():.6f}, max={qk.max():.6f}, has_nan={torch.isnan(qk).any()}")
                 
                 masked_qk = qk * causal_mask[t_start:t_end, expanded_t_start:expanded_t_end]
                 print(f"[HELPER1] Applied causal mask, masked_qk shape: {masked_qk.shape}")
+                print(f"[HELPER1] masked_qk values: min={masked_qk.min():.6f}, max={masked_qk.max():.6f}, has_nan={torch.isnan(masked_qk).any()}")
                 
                 # Compute A^T @ dO: (chunk_size, chunk_size)^T @ (chunk_size, V) -> (chunk_size, V)
+                print(f"[HELPER1] do_chunk[{b}, :, {h}] values: min={do_chunk[b, :, h].min():.6f}, max={do_chunk[b, :, h].max():.6f}, has_nan={torch.isnan(do_chunk[b, :, h]).any()}")
                 du_chunk = torch.mm(masked_qk.t(), do_chunk[b, :, h])
                 print(f"[HELPER1] Computed du_chunk with shape {du_chunk.shape}")
+                print(f"[HELPER1] du_chunk values: min={du_chunk.min():.6f}, max={du_chunk.max():.6f}, has_nan={torch.isnan(du_chunk).any()}")
                 
                 # Store result
                 du_direct[b, expanded_t_start:expanded_t_end, h] = du_chunk
@@ -191,9 +197,17 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
     du_final = torch.zeros_like(du_direct) 
     print(f"[HELPER2] Initialized du_final with shape {du_final.shape}")
 
-    gated_q = q * g.unsqueeze(-1).exp()
-    gated_w = w * g_expanded.unsqueeze(-1).exp()
+    g_exp = g.unsqueeze(-1).exp()
+    g_expanded_exp = g_expanded.unsqueeze(-1).exp()
+    print(f"[HELPER2] g values: min={g.min():.6f}, max={g.max():.6f}, has_nan={torch.isnan(g).any()}")
+    print(f"[HELPER2] g_expanded values: min={g_expanded.min():.6f}, max={g_expanded.max():.6f}, has_nan={torch.isnan(g_expanded).any()}")
+    print(f"[HELPER2] g_exp values: min={g_exp.min():.6f}, max={g_exp.max():.6f}, has_nan={torch.isnan(g_exp).any()}")
+    print(f"[HELPER2] g_expanded_exp values: min={g_expanded_exp.min():.6f}, max={g_expanded_exp.max():.6f}, has_nan={torch.isnan(g_expanded_exp).any()}")
+    gated_q = q * g_exp
+    gated_w = w * g_expanded_exp
     print(f"[HELPER2] Computed gated tensors: gated_q={gated_q.shape}, gated_w={gated_w.shape}")
+    print(f"[HELPER2] gated_q values: min={gated_q.min():.6f}, max={gated_q.max():.6f}, has_nan={torch.isnan(gated_q).any()}")
+    print(f"[HELPER2] gated_w values: min={gated_w.min():.6f}, max={gated_w.max():.6f}, has_nan={torch.isnan(gated_w).any()}")
     
     # Use q and do directly instead of expanding - more efficient approach per PDF
     
@@ -232,7 +246,7 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
         # Map to corresponding expanded indices
         # expanded_start to expanded_end corresponds to BT * num_householder expanded tokens
         expanded_start = q_t_start * num_householder
-        expanded_end = min(q_t_end * num_householder, T_expanded)
+        expanded_end = min(q_t_end + BT * num_householder, T_expanded)
         expanded_size = expanded_end - expanded_start
         
         chunk_ds = torch.zeros(B, H, K, V, device=q.device)
@@ -252,10 +266,18 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
             
             # Extract K block
             k_chunk = k[:, k_t_start:k_t_end]
+            print(f"[HELPER2] k_chunk values: min={k_chunk.min():.6f}, max={k_chunk.max():.6f}, has_nan={torch.isnan(k_chunk).any()}")
             # Apply gating: exp(g_expanded[t+N-1] - g_expanded[t:t+N])
             g_last = g_expanded[:, expanded_end-1, :, None]  # (B, 1, H, 1)
             g_current = g_expanded[:, k_t_start:k_t_end, :, None]  # (B, k_block_size, H, 1)
-            gated_k_chunk = k_chunk * torch.exp(g_last - g_current)
+            print(f"[HELPER2] g_last values: min={g_last.min():.6f}, max={g_last.max():.6f}, has_nan={torch.isnan(g_last).any()}")
+            print(f"[HELPER2] g_current values: min={g_current.min():.6f}, max={g_current.max():.6f}, has_nan={torch.isnan(g_current).any()}")
+            g_diff = g_last - g_current
+            print(f"[HELPER2] g_diff (g_last - g_current) values: min={g_diff.min():.6f}, max={g_diff.max():.6f}, has_nan={torch.isnan(g_diff).any()}")
+            g_exp_diff = torch.exp(g_diff)
+            print(f"[HELPER2] g_exp_diff values: min={g_exp_diff.min():.6f}, max={g_exp_diff.max():.6f}, has_nan={torch.isnan(g_exp_diff).any()}")
+            gated_k_chunk = k_chunk * g_exp_diff
+            print(f"[HELPER2] gated_k_chunk values: min={gated_k_chunk.min():.6f}, max={gated_k_chunk.max():.6f}, has_nan={torch.isnan(gated_k_chunk).any()}")
             k_block = gated_k_chunk  # (B, k_block_size, H, K)
 
             # TODO can divide dk and dv into blocks 
@@ -263,10 +285,15 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
             for b in range(B):
                 for h in range(H):
                     # K_block: (k_block_size, K), prev_ds: (K, V) -> (k_block_size, V)
+                    print(f"[HELPER2] k_block[{b}, :, {h}] values: min={k_block[b, :, h].min():.6f}, max={k_block[b, :, h].max():.6f}, has_nan={torch.isnan(k_block[b, :, h]).any()}")
+                    print(f"[HELPER2] prev_ds[{b}, {h}] values: min={prev_ds[b, h].min():.6f}, max={prev_ds[b, h].max():.6f}, has_nan={torch.isnan(prev_ds[b, h]).any()}")
                     k_ds_block = torch.mm(k_block[b, :, h], prev_ds[b, h])
+                    print(f"[HELPER2] k_ds_block values: min={k_ds_block.min():.6f}, max={k_ds_block.max():.6f}, has_nan={torch.isnan(k_ds_block).any()}")
                     
                     # Add direct gradient contribution
+                    print(f"[HELPER2] du_direct[{b}, {k_t_start}:{k_t_end}, {h}] values: min={du_direct[b, k_t_start:k_t_end, h].min():.6f}, max={du_direct[b, k_t_start:k_t_end, h].max():.6f}, has_nan={torch.isnan(du_direct[b, k_t_start:k_t_end, h]).any()}")
                     du_final[b, k_t_start:k_t_end, h] = k_ds_block + du_direct[b, k_t_start:k_t_end, h]
+                    print(f"[HELPER2] du_final[{b}, {k_t_start}:{k_t_end}, {h}] values: min={du_final[b, k_t_start:k_t_end, h].min():.6f}, max={du_final[b, k_t_start:k_t_end, h].max():.6f}, has_nan={torch.isnan(du_final[b, k_t_start:k_t_end, h]).any()}")
         # du_final is completely computed at this point 
         
         # Step 2: Compute ∂/∂S[t]^T contributions using q and do block multiplication
@@ -436,7 +463,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
         # S[t] = 1/exp(g[t+N-1]) * \arrow{S}[t]
         # dL/d g[t+N-1] = dL/dS[t] * \arrow{S}[t] * (- 1/exp(g[t+N-1]))  
         # (B,H,K,V) -> (B,H) by summing dim 2 and 3 
-        dg_contrib = (ds_chunk * gated_s_chunk * - (1/g_expanded[:, expanded_end-1, :, None].exp())).sum(dim=(2,3))
+        dg_contrib = (ds_chunk * gated_s_chunk * - (1/g_expanded[:, expanded_end-1, :, None, None].exp())).sum(dim=(2,3))
         print(f"[HELPER3] Computing dg contribution: {dg_contrib.shape}")
         dg_expanded[:, expanded_end-1, :] += dg_contrib
         
@@ -562,7 +589,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
                     print(f"[HELPER3] Term 2 v_new_block shape: {v_new_block.shape}, v_new_block_T shape: {v_new_block_T.shape}")
 
                     # computing A = dO * dvnew^T \cdot M as blocks (BT \times BV @ BV \times BT -> BT \times BT)
-                    dA = torch.mm(do_chunk[b, :, h], v_new_block_T.t()) * causal_mask_chunk  # (q_chunk_size, v_new_block_size)
+                    dA = torch.mm(do_chunk[b, :, h], v_new_block_T) * causal_mask_chunk  # (q_chunk_size, v_new_block_size)
                     print(f"[HELPER3] Term 2 dA shape: {dA.shape}")
                     
                     # Final: (dA)^T × Q' -> (v_new_block_size, K)

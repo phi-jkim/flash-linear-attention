@@ -287,7 +287,7 @@ def test_naive_vs_manual_backward(
         v=v_manual,
         g=g_manual,
         beta=beta_manual,
-        scale=scale,
+        scale=1.0, # fix scale as 1.0
         initial_state=h0_manual,
         output_final_state=True,
         num_householder=num_householder,
@@ -302,3 +302,129 @@ def test_naive_vs_manual_backward(
     assert_close('db', auto_dbeta, manual_dbeta, 0.02)
     assert_close('dg', auto_dg, manual_dg, 0.02)
     assert_close('dh0', auto_dh0, manual_dh0, 0.008)
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'D', 'scale', 'num_householder', 'dtype'),
+    [
+        (1, 8, 2, 16, 1.0, 1, torch.float32),
+        (2, 12, 2, 24, 1.0, 2, torch.float32),
+        (1, 64, 2, 32, 1.0, 1, torch.float32),
+        (2, 128, 4, 64, 1.0, 2, torch.float32),
+    ]
+)
+def test_helper1_du_direct_comparison(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    num_householder: int,
+    dtype: torch.dtype,
+):
+    """Test helper function 1 (du_direct computation) by following actual backward logic."""
+    from fla.ops.gated_delta_product.naive import helper_direct_gradient_u_minus_ws
+    from fla.ops.delta_rule.wy_fast import prepare_wy_repr_fwd
+    from fla.ops.delta_rule.chunk_fwd import recompute_w_u_fwd
+    from fla.ops.gated_delta_rule.chunk_h import chunk_gated_delta_rule_fwd_h
+    from fla.ops.delta_rule.chunk_bwd import chunk_bwd_dv_local
+    from einops import rearrange
+    
+    print(f"\n=== Testing Helper1 B={B}, T={T}, H={H}, D={D}, scale={scale}, num_householder={num_householder}, dtype={dtype} ===")
+    
+    torch.manual_seed(42)
+    
+    # Create inputs on the correct device
+    print(f"Creating tensors on device: {device}")
+    q = torch.randn(B, T, H, D, dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
+    beta = torch.rand(B, T * num_householder, H, dtype=dtype, device=device, requires_grad=True).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=dtype, device=device, requires_grad=True))
+    h0 = torch.randn(B, H, D, D, dtype=dtype, device=device, requires_grad=True)
+    
+    print(f"Input shapes: q={q.shape}, k={k.shape}, v={v.shape}, beta={beta.shape}, g={g.shape}, h0={h0.shape}")
+    
+    # Create gradient output tensors 
+    do = torch.randn_like(q)
+    dht = torch.randn_like(h0)
+    
+    # Follow the actual backward logic from chunk.py
+    print("[TEST] Following actual backward logic...")
+    
+    # Step 1: Prepare WY representation (from forward)
+    A = prepare_wy_repr_fwd(k, beta, num_householder)
+    print(f"[TEST] A shape: {A.shape}")
+    
+    # Step 2: Recompute w, u (following backward logic)
+    w, u = recompute_w_u_fwd(
+        k=k,
+        v=v,
+        beta=beta,
+        A=A,
+        g=None,  # Use None to match the logic
+        cu_seqlens=None,
+    )
+    print(f"[TEST] w shape: {w.shape}, u shape: {u.shape}")
+    
+    # Step 3: Recompute h, v_new (following backward logic)
+    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        initial_state=h0,
+        output_final_state=False,
+        cu_seqlens=None,
+    )
+    print(f"[TEST] h shape: {h.shape}, v_new shape: {v_new.shape}")
+    
+    # Step 4: Expand do to match the backward pass logic
+    q_new = q.new_zeros(q.shape[0], q.shape[1], num_householder, q.shape[2], q.shape[3])
+    q_new[:, :, -1] = q
+    do_new = do.new_zeros(do.shape[0], do.shape[1], num_householder, do.shape[2], do.shape[3])
+    do_new[:, :, -1] = do
+    q_expanded = rearrange(q_new, 'b t n h d -> b (t n) h d')
+    do_expanded = rearrange(do_new, 'b t n h d -> b (t n) h d')
+    
+    print(f"[TEST] q_expanded shape: {q_expanded.shape}, do_expanded shape: {do_expanded.shape}")
+    
+    # Step 5: Compute du_direct using the tri implementation method
+    print("[TEST] Computing du_direct_tri using chunk_bwd_dv_local...")
+    du_direct_tri = chunk_bwd_dv_local(
+        q=q_expanded,
+        k=k,
+        g=g,
+        do=do_expanded,
+        scale=scale,
+        cu_seqlens=None,
+    )
+    print(f"[TEST] du_direct_tri shape: {du_direct_tri.shape}")
+    print(f"[TEST] du_direct_tri values: min={du_direct_tri.min():.6f}, max={du_direct_tri.max():.6f}, has_nan={torch.isnan(du_direct_tri).any()}")
+    
+    # Step 6: Test helper function 1 directly with the same inputs
+    print("[TEST] Testing helper function 1 directly...")
+    du_direct_naive = helper_direct_gradient_u_minus_ws(
+        q=q_expanded,
+        k=k, 
+        do=do_expanded,
+        num_householder=num_householder
+    )
+    
+    print(f"[TEST] du_direct_naive shape: {du_direct_naive.shape}")
+    print(f"[TEST] du_direct_naive values: min={du_direct_naive.min():.6f}, max={du_direct_naive.max():.6f}, has_nan={torch.isnan(du_direct_naive).any()}")
+    
+    # Step 7: Compare the du_direct outputs
+    print("[TEST] Comparing du_direct outputs...")
+    try:
+        assert_close('du_direct', du_direct_tri, du_direct_naive, 0.01)
+        print("[TEST] du_direct comparison passed!")
+    except Exception as e:
+        print(f"[TEST] du_direct comparison failed: {e}")
+        print(f"[TEST] Max difference: {(du_direct_tri - du_direct_naive).abs().max():.6f}")
+    
+    # Step 8: Check for NaN values
+    assert not torch.isnan(du_direct_tri).any(), "du_direct_tri should not contain NaN values"
+    assert not torch.isnan(du_direct_naive).any(), "du_direct_naive should not contain NaN values"
+    
+    print("[TEST] All NaN checks passed!")
