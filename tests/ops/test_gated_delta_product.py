@@ -488,15 +488,16 @@ def test_helper2_du_final_comparison(
     
     # Create inputs on the correct device
     print(f"Creating tensors on device: {device}")
-    # q = torch.randn(B, T, H, D, dtype=dtype, device=device, requires_grad=True)
-    # k = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
+    q = torch.randn(B, T, H, D, dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
     # TODO: Jinha normalize so that values are not huge 
-    q = torch.nn.functional.normalize(torch.randn((1, T, H, D), dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
-    k = torch.nn.functional.normalize(torch.randn(1, T*num_householder, H, D, dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
+    # q = torch.nn.functional.normalize(torch.randn((1, T, H, D), dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
+    # k = torch.nn.functional.normalize(torch.randn(1, T*num_householder, H, D, dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
     v = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
     beta = torch.rand(B, T * num_householder, H, dtype=dtype).sigmoid().to(device=device)
     beta.requires_grad_(True)
-    h0 = torch.nn.functional.normalize(torch.randn(B, H, D, D, dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
+    h0 = torch.randn(B, H, D, D, dtype=dtype, device=device, requires_grad=True)
+    # h0 = torch.nn.functional.normalize(torch.randn(B, H, D, D, dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
     g = F.logsigmoid(torch.rand(B, T, H, dtype=dtype, device=device, requires_grad=True))
     g_expanded = g.new_zeros(g.shape[0], g.shape[1], num_householder, g.shape[2], dtype=torch.float32)
     g_expanded[:, :, 0] = g
@@ -589,10 +590,10 @@ def test_helper2_du_final_comparison(
         dv=du_direct_tri,
         scale=scale,
         cu_seqlens=None,
-        chunk_size=64,
     )
     print(f"[TEST] dh_tri shape: {dh_tri.shape}, dh0_tri shape: {dh0_tri.shape}, dv_tri shape: {dv_tri.shape}")
     print(f"[TEST] dv_tri values: min={dv_tri.min():.6f}, max={dv_tri.max():.6f}, has_nan={torch.isnan(dv_tri).any()}")
+    print(f"[TEST] dh0_tri values: min={dh0_tri.min():.6f}, max={dh0_tri.max():.6f}, has_nan={torch.isnan(dh0_tri).any()}")
     
     # Step 8: Test helper function 2 directly with the same inputs
     print("[TEST] Testing helper function 2 directly...")
@@ -621,6 +622,8 @@ def test_helper2_du_final_comparison(
     print("[TEST] Comparing du_final outputs...")
     # The actual implementation returns dv_tri which should correspond to du_final_naive
     assert_close('du_final', dv_tri, du_final_naive, 0.01)
+
+    print("[TEST] Comparing ds_initial outputs... dh0_tri shape", dh0_tri.shape, "ds_final_naive shape", ds_final_naive[:, 0].shape)
 
     assert_close('ds_initial', dh0_tri, ds_final_naive[:, 0], 0.01)
 
