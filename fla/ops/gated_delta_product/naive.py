@@ -50,7 +50,7 @@ def naive_recurrent_gated_delta_product(q, k, v, g, beta, scale, cu_seqlens,
 
 
 # Helper Function 1: Direct gradient computation for U[t] - W[t]S[t]^T (PDF Section 1)
-def helper_direct_gradient_u_minus_ws(q, k, do, num_householder):
+def helper_direct_gradient_u_minus_ws(q, k, do, g, num_householder):
     """
     Compute direct gradient ∂/∂(U[t] - W[t]S[t]^T) = (Q'[t:t+N]K[t:t+N]^T ⊙ M)^T · ∂/∂O'[t:t+N]
     
@@ -141,13 +141,13 @@ def helper_direct_gradient_u_minus_ws(q, k, do, num_householder):
                 print(f"[HELPER1] Computed QK^T with shape {qk.shape} for batch {b}, head {h}")
                 print(f"[HELPER1] qk values: min={qk.min():.6f}, max={qk.max():.6f}, has_nan={torch.isnan(qk).any()}")
                 
-                masked_qk = qk * causal_mask[t_start:t_end, expanded_t_start:expanded_t_end]
+                masked_qk = qk * causal_mask[t_start:t_end, expanded_t_start:expanded_t_end] # TODO check why we multiplty g (follows the chunk_o)
                 print(f"[HELPER1] Applied causal mask, masked_qk shape: {masked_qk.shape}")
                 print(f"[HELPER1] masked_qk values: min={masked_qk.min():.6f}, max={masked_qk.max():.6f}, has_nan={torch.isnan(masked_qk).any()}")
                 
                 # Compute A^T @ dO: (chunk_size, chunk_size)^T @ (chunk_size, V) -> (chunk_size, V)
                 print(f"[HELPER1] do_chunk[{b}, :, {h}] values: min={do_chunk[b, :, h].min():.6f}, max={do_chunk[b, :, h].max():.6f}, has_nan={torch.isnan(do_chunk[b, :, h]).any()}")
-                du_chunk = torch.mm(masked_qk.t(), do_chunk[b, :, h])
+                du_chunk = torch.mm(masked_qk.t(), do_chunk[b, :, h]) 
                 print(f"[HELPER1] Computed du_chunk with shape {du_chunk.shape}")
                 print(f"[HELPER1] du_chunk values: min={du_chunk.min():.6f}, max={du_chunk.max():.6f}, has_nan={torch.isnan(du_chunk).any()}")
                 
@@ -246,12 +246,11 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
         # Map to corresponding expanded indices
         # expanded_start to expanded_end corresponds to BT * num_householder expanded tokens
         expanded_start = q_t_start * num_householder
-        expanded_end = min(q_t_end + BT * num_householder, T_expanded)
+        expanded_end = min(expanded_start + BT_true * num_householder, T_expanded)
         expanded_size = expanded_end - expanded_start
         
-        chunk_ds = torch.zeros(B, H, K, V, device=q.device)
+        chunk_ds = torch.zeros(B, H, K, V, device=q.device, dtype=q.dtype)
 
-        
         # Step 1: Compute du_final using block multiplication for K matrices
         # Process K matrices in blocks of BT_expanded
         num_k_blocks = math.ceil(expanded_size / BT_expanded)
@@ -268,10 +267,12 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
             k_chunk = k[:, k_t_start:k_t_end]
             print(f"[HELPER2] k_chunk values: min={k_chunk.min():.6f}, max={k_chunk.max():.6f}, has_nan={torch.isnan(k_chunk).any()}")
             # Apply gating: exp(g_expanded[t+N-1] - g_expanded[t:t+N])
-            g_last = g_expanded[:, expanded_end-1, :, None]  # (B, 1, H, 1)
+            g_last = g_expanded[:, expanded_end-1:expanded_end, :, None]  # (B, 1, H, 1)
             g_current = g_expanded[:, k_t_start:k_t_end, :, None]  # (B, k_block_size, H, 1)
+            print(f"[HELPER2] g_last shape: {g_last.shape}, g_current shape: {g_current.shape}")
             print(f"[HELPER2] g_last values: min={g_last.min():.6f}, max={g_last.max():.6f}, has_nan={torch.isnan(g_last).any()}")
             print(f"[HELPER2] g_current values: min={g_current.min():.6f}, max={g_current.max():.6f}, has_nan={torch.isnan(g_current).any()}")
+            # Use broadcasting: (B, 1, H, 1) - (B, k_block_size, H, 1) -> (B, k_block_size, H, 1)
             g_diff = g_last - g_current
             print(f"[HELPER2] g_diff (g_last - g_current) values: min={g_diff.min():.6f}, max={g_diff.max():.6f}, has_nan={torch.isnan(g_diff).any()}")
             g_exp_diff = torch.exp(g_diff)
@@ -562,8 +563,6 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
                 dk_arrow += term1_contrib
                 print(f"[HELPER3] dk_arrow after Term 1: shape {dk_arrow.shape}, norm {dk_arrow.norm():.6f}")
 
-                # TODO replace BT_expanded with BT_true 
-
                 # Term 2: (∂/∂O × ((Ũ - WS^T)^T ⊙ M))^T × Q' and multiplied by e^(gamma_[t:t+N] - gamma_[t+N-1])
                 num_v_blocks = math.ceil(expanded_size / BT_expanded)
                 print(f"[HELPER3] Term 2: Processing {num_v_blocks} v_new blocks")
@@ -680,6 +679,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
                     # expanded_end does not have to be q_t_end * num_householder but it corresponds to last expanded otken of 
                     # the expanded chunk 
                     if block_end > 0:
+                        print(torch.exp(-g_expanded_current_block + g_expanded_last))
                         dk_last_contrib = ((dk[b, block_start:block_end, h] * k[b, block_start:block_end, h]).sum(dim=1) * torch.exp(-g_expanded_current_block + g_expanded_last)).sum()
                         print(f"[HELPER3] dk->dg_expanded last contribution: {dk_last_contrib}")
                         dg_expanded[b, block_end-1, h] += dk_last_contrib
@@ -886,7 +886,7 @@ def gated_naive_torch_delta_product_bwd(
     # Step 1: Compute direct gradient using Helper Function 1
     print(f"[MAIN_BWD] Step 1: Calling helper_direct_gradient_u_minus_ws")
     du_direct = helper_direct_gradient_u_minus_ws(
-        q, k, do, num_householder
+        q, k, do, g, num_householder
     )
     print(f"[MAIN_BWD] Step 1 completed: du_direct={du_direct.shape}")
     
@@ -919,7 +919,7 @@ def gated_naive_torch_delta_product_bwd(
     # assert dg_final.dtype == torch.float32, "dg should be fp32"
     dg_final = chunk_local_cumsum(dg_final, chunk_size=64, reverse=True)
 
-    ds0 = ds_final[:, 0]
+    ds0 = ds_final[:, 0].T
     # only the first hidden state gradient needs to be returned ds0 for computing gradient of previous chunk 
     
     # Return in the expected order: (dq, dk, dv, dg, dbeta, dh0)

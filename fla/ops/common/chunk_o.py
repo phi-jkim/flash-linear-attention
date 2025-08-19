@@ -269,7 +269,7 @@ def chunk_bwd_kernel_dqkwg(
         b_dg += tl.sum(b_ds2, axis=1)
         b_dg -= tl.sum(b_ds2, axis=0)
 
-        # TODO don't we also need to compute from b_dw?
+        # TODO don't we also need to compute g from b_dw?
 
         b_ds = b_ds.to(b_k.dtype)
         # [BT, BK]
