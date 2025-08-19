@@ -313,6 +313,11 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             b_dh4 += tl.load(p_dht4, boundary_check=(0, 1))
 
     for i_t in range(NT - 1, -1, -1):
+        # TODO: Jinha: maybe we should store this at the end of the loop 
+        # or otherwise will store for the gradients of h as dht at i_t = NT - 1 
+        # and then dht + gradient of h from last Ot for next iteration (not sure if this is desired)
+        # is dh intended to be dht, then dS_last, dS_last-1 ... dS1 and dh0 is dS0 intended
+
         p_dh1 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         tl.store(p_dh1, b_dh1.to(p_dh1.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
@@ -411,20 +416,6 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 b_q = b_q * b_g_exp[None, :]
             b_q = (b_q * scale).to(b_q.dtype)
             b_dh4 += tl.dot(b_q, b_do.to(b_q.dtype))-tl.dot(b_w, b_dv.to(b_w.dtype))
-
-    if USE_INITIAL_STATE:
-        p_dh0 = tl.make_block_ptr(dh0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-        tl.store(p_dh0, b_dh1.to(p_dh0.dtype.element_ty), boundary_check=(0, 1))
-        if K > 64:
-            p_dh1 = tl.make_block_ptr(dh0, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
-            tl.store(p_dh1, b_dh2.to(p_dh1.dtype.element_ty), boundary_check=(0, 1))
-        if K > 128:
-            p_dh2 = tl.make_block_ptr(dh0, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0))
-            tl.store(p_dh2, b_dh3.to(p_dh2.dtype.element_ty), boundary_check=(0, 1))
-        if K > 192:
-            p_dh3 = tl.make_block_ptr(dh0, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
-            tl.store(p_dh3, b_dh4.to(p_dh3.dtype.element_ty), boundary_check=(0, 1))
-
 
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,

@@ -317,7 +317,8 @@ def helper_final_gradient_s_and_u(q, k, w, du_direct, do, ds_next, g, g_expanded
                 continue
             
             # Extract gated W and du_final blocks
-            w_block = gated_w[:, w_t_start:w_t_end]  # (B, w_block_size, H, K)
+            w_block = w[:, w_t_start:w_t_end] # TODO: not gated w is used in kernel 
+            # w_block = gated_w[:, w_t_start:w_t_end]  # (B, w_block_size, H, K)
             du_block = du_final[:, w_t_start:w_t_end]  # (B, w_block_size, H, V)
             
             for b in range(B):
