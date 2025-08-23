@@ -687,11 +687,11 @@ def test_helper3_gradient_qwkg_comparison(
     
     # Create inputs on the correct device
     print(f"Creating tensors on device: {device}")
-    q = torch.randn(B, T, H, D, dtype=dtype, device=device, requires_grad=True)
-    k = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
+    # q = torch.randn(B, T, H, D, dtype=dtype, device=device, requires_grad=True)
+    # k = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
     # TODO: Jinha normalize so that values are not huge 
-    # q = torch.nn.functional.normalize(torch.randn((1, T, H, D), dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
-    # k = torch.nn.functional.normalize(torch.randn(1, T*num_householder, H, D, dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
+    q = torch.nn.functional.normalize(torch.randn((1, T, H, D), dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
+    k = torch.nn.functional.normalize(torch.randn(1, T*num_householder, H, D, dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
     v = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
     beta = torch.rand(B, T * num_householder, H, dtype=dtype).sigmoid().to(device=device)
     beta.requires_grad_(True)
@@ -842,7 +842,7 @@ def test_helper3_gradient_qwkg_comparison(
         k=k,
         v=v_new,
         do=do_expanded,
-        h=s,
+        h=h,
         dh=dh,  
         g=None,  # No gating
         dv=du_final,

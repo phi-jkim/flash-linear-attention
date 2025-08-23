@@ -479,7 +479,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
                 # Term 1: do @ ds_chunk (state gradient contribution)
                 # Direct matrix multiplication: do_chunk @ ds_chunk^T -> (q_chunk_size, K)
                 # do_chunk: (q_chunk_size, V), ds_chunk: (K, V) -> ds_chunk^T: (V, K)
-                dq_arrow= torch.mm(do_chunk[b, :, h], ds_chunk[b, h].t())  # (q_chunk_size, K)
+                dq_arrow= torch.mm(do_chunk[b, :, h], s_chunk[b, h].t())  # (q_chunk_size, K)
                 print(f"[HELPER3] Term 1 dq_arrow shape: {dq_arrow.shape}")
             
                 # dq_contrib = dq_contrib * causal_mask_chunk.unsqueeze(-1)
@@ -536,7 +536,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
                 # du_chunk: (expanded_chunk_size, V), ds_chunk: (K, V)
                 # ds_chunk^T: (V, K) -> result: (expanded_chunk_size, K)
                 # TODO need to batch and parallelize 
-                dw_arrow = -torch.mm(du_chunk[b, :, h], ds_chunk[b, h].t())  # (expanded_chunk_size, K)
+                dw_arrow = -torch.mm(du_chunk[b, :, h], s_chunk[b, h].t())  # (expanded_chunk_size, K)
                 print(f"[HELPER3] dw_arrow shape: {dw_arrow.shape}")
                 
                 dw[b, expanded_start:expanded_end, h] += dw_arrow
@@ -549,20 +549,11 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
         for b in range(B):
             for h in range(H):
                 print(f"[HELPER3] Computing dK for batch {b}, head {h}")
-                dk_arrow = torch.zeros(expanded_end - expanded_start, K, device=q.device)
-                print(f"[HELPER3] Initialized dk_arrow with shape: {dk_arrow.shape}")
                 
                 # Term 1: (Ũ - WS^T) × ∂/∂S[t+1] 
                 # du_chunk represents (Ũ - WS^T): (expanded_chunk_size, V)
                 # ds_chunk represents next ds ∂/∂S[t+1]: (K, V) if it exists and otherwise dht (last state gradient provided to bwd)
                 # TODO: need to separate into block multiplication
-                print(f"[HELPER3] Term 1: du_chunk[{b}, :, {h}] shape: {du_chunk[b, :, h].shape}")
-                print(f"[HELPER3] Term 1: ds_chunk_next[{b}, {h}] shape: {ds_chunk_next[b, h].shape}")
-                term1_contrib = torch.mm(du_chunk[b, :, h], ds_chunk_next[b, h].t())  # (expanded_chunk_size, K)
-                print(f"[HELPER3] Term 1 contrib shape: {term1_contrib.shape}")
-                
-                dk_arrow += term1_contrib
-                print(f"[HELPER3] dk_arrow after Term 1: shape {dk_arrow.shape}, norm {dk_arrow.norm():.6f}")
 
                 # Term 2: (∂/∂O × ((Ũ - WS^T)^T ⊙ M))^T × Q' and multiplied by e^(gamma_[t:t+N] - gamma_[t+N-1])
                 num_v_blocks = math.ceil(expanded_size / BT_expanded)
@@ -572,7 +563,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
                     v_new_t_start = expanded_start + v_new_block_idx * BT_expanded
                     v_new_t_end = min(v_new_t_start + BT_expanded, expanded_end)
                     v_new_block_size = v_new_t_end - v_new_t_start
-                    
+
                     print(f"[HELPER3] Term 2 block {v_new_block_idx}: start={v_new_t_start}, end={v_new_t_end}, size={v_new_block_size}")
                     
                     # causal mask for this block (M matrix from screenshot)
@@ -587,6 +578,15 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
                     v_new_block = v_new[:, v_new_t_start:v_new_t_end]  
                     v_new_block_T = v_new_block[b, :, h].t()  # v_new^T: (dV, v_new_block_size) 
                     print(f"[HELPER3] Term 2 v_new_block shape: {v_new_block.shape}, v_new_block_T shape: {v_new_block_T.shape}")
+
+
+                    print(f"[HELPER3] Term 1: v_new_block shape: {v_new_block.shape}")
+                    print(f"[HELPER3] Term 1: ds_chunk_next[{b}, {h}] shape: {ds_chunk_next[b, h].shape}")
+                    term1_contrib = torch.mm(v_new_block[b, :, h], ds_chunk_next[b, h].t())  # (expanded_chunk_size, K)
+                    print(f"[HELPER3] Term 1 contrib shape: {term1_contrib.shape}")
+            
+                    dk[b, v_new_t_start:v_new_t_end, h] += term1_contrib
+                    print(f"[HELPER3] Term 1 added to dk, new norm {dk.norm():.6f}")
 
                     # computing A = dO * dvnew^T \cdot M as blocks (BT \times BV @ BV \times BT -> BT \times BT)
                     dA = torch.mm(do_chunk[b, :, h], v_new_block_T) * causal_mask_chunk  # (q_chunk_size, v_new_block_size)
@@ -603,15 +603,9 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
                     g_factor = (g_expanded[b, v_new_t_start:v_new_t_end, h] - g_expanded[b, expanded_end - 1, h]).exp()[:, None]
                     print(f"[HELPER3] Term 2 g_factor shape: {g_factor.shape}")
                     
-                    block_start_idx = v_new_t_start - expanded_start
-                    block_end_idx = v_new_t_end - expanded_start
-                    print(f"[HELPER3] Term 2 storing in dk_arrow[{block_start_idx}:{block_end_idx}]")
-                    
-                    dk_arrow[block_start_idx:block_end_idx] += term2_block * g_factor
-                    print(f"[HELPER3] Term 2 added to dk_arrow, new norm: {dk_arrow.norm():.6f}")
+                    dk[b, v_new_t_start:v_new_t_end, h] += term2_block * g_factor
+                    print(f"[HELPER3] Term 2 added to dk, new norm: {dk.norm():.6f}")
                 
-                print(f"[HELPER3] Final dk_arrow shape: {dk_arrow.shape}, norm: {dk_arrow.norm():.6f}")
-                dk[b, expanded_start:expanded_end, h] = dk_arrow
                 print(f"[HELPER3] Stored dk for batch {b}, head {h} at indices [{expanded_start}:{expanded_end}]")
 
     # TODO double check the dg implementation 
@@ -912,7 +906,7 @@ def gated_naive_torch_delta_product_bwd(
     # Step 4: Compute hidden gradients using Helper Function 4 and add to direct gradients of dk and dg 
     print(f"[MAIN_BWD] Step 4: Calling helper_hidden_gradient_kvgb")
     dk_final, dg_final, dv_final, dbeta_final = helper_hidden_gradient_kvgb(
-        k, g_expanded, v, beta, dk_direct, dg_expanded_direct, dw, du_final, A
+        k, g_expanded, v, beta, dk_direct, dg_expanded_direct, dw, du_final, v A
     )
     print(f"[MAIN_BWD] Step 4 completed: dk_final={dk_final.shape}, dg_final={dg_final.shape}")
     print(f"[MAIN_BWD] Step 4 completed: dv_final={dv_final.shape}, dbeta_final={dbeta_final.shape}")
