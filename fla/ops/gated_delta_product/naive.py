@@ -399,7 +399,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
     assert(BT_true == BT_expanded)
     
     # Process chunks based on true sequence
-    num_chunks = math.ceil(T_true / BT_true)
+    num_chunks = math.ceil(T_expanded / (num_householder * BT_expanded))
     print(f"[HELPER3] Using BT_true={BT_true}, BT_expanded={BT_expanded}, num_chunks={num_chunks}")
 
     # Apply causal mask
@@ -440,7 +440,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
         
         # Extract state gradients for this chunk
         # s_next is not needed 
-        s_chunk = s[:, chunk_idx]  # s is (B, num_chunks, H, K, V)
+        s_chunk = s[:, chunk_idx*num_householder]  # s is (B, num_chunks, H, K, V)
         gated_s_chunk = s_chunk * g_expanded[:, expanded_end-1, :, None, None].exp()
         
         print(f"[HELPER3] State chunks: s_chunk={s_chunk.shape}, gated_s_chunk={gated_s_chunk.shape}")

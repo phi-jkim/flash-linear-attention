@@ -264,7 +264,7 @@ def chunk_bwd_kernel_dqkwg(
         b_dg -= tl.sum(b_k * b_dk, axis=1) # TODO jinha: should this be before b_dk is computed from b_dk{rightarrow}
         b_dg_last += tl.sum(b_dk * b_k)
 
-        b_ds = tl.where(m_A, b_ds * exp(b_g[:, None] - b_g[None, :]), 0) * scale
+        b_ds = tl.where(m_A, b_ds * exp(b_g[:, None] - b_g[None, :]), 0) * scale # TODO check if gate should be applied here
         b_ds2 = b_ds * tl.dot(b_q, tl.trans(b_k))
         b_dg += tl.sum(b_ds2, axis=1)
         b_dg -= tl.sum(b_ds2, axis=0)

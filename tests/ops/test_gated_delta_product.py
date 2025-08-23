@@ -672,7 +672,7 @@ def test_helper3_gradient_qwkg_comparison(
     dtype: torch.dtype,
 ):
     """Test helper function 3 (gradient computation for Q, W, K, g) without gating (g=0)."""
-    from fla.ops.gated_delta_product.naive import helper_gradient_qwkg
+    from fla.ops.gated_delta_product.naive import helper_gradient_qwkg, helper_direct_gradient_u_minus_ws, helper_final_gradient_s_and_u
     from fla.ops.common.chunk_o import chunk_bwd_dqkwg
     from fla.ops.delta_rule.wy_fast import recompute_w_u_fwd
     from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h, chunk_gated_delta_rule_bwd_dhu
@@ -687,11 +687,11 @@ def test_helper3_gradient_qwkg_comparison(
     
     # Create inputs on the correct device
     print(f"Creating tensors on device: {device}")
-    # q = torch.randn(B, T, H, D, dtype=dtype, device=device, requires_grad=True)
-    # k = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
+    q = torch.randn(B, T, H, D, dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
     # TODO: Jinha normalize so that values are not huge 
-    q = torch.nn.functional.normalize(torch.randn((1, T, H, D), dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
-    k = torch.nn.functional.normalize(torch.randn(1, T*num_householder, H, D, dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
+    # q = torch.nn.functional.normalize(torch.randn((1, T, H, D), dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
+    # k = torch.nn.functional.normalize(torch.randn(1, T*num_householder, H, D, dtype=dtype, device=device, requires_grad=True), dim=-1, p=2)
     v = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
     beta = torch.rand(B, T * num_householder, H, dtype=dtype).sigmoid().to(device=device)
     beta.requires_grad_(True)
@@ -763,62 +763,60 @@ def test_helper3_gradient_qwkg_comparison(
     
     print(f"[TEST] q_expanded shape: {q_expanded.shape}, do_expanded shape: {do_expanded.shape}")
     
-    # Step 5: Compute intermediate gradients using actual implementation
-    print("[TEST] Computing intermediate gradients...")
+    # Step 6: Compute du_direct using actual implementation
+    print("[TEST] Computing du_direct using helper_direct_gradient_u_minus_ws...")
+    du_direct = helper_direct_gradient_u_minus_ws(
+        q=q.clone(),
+        k=k.clone(), 
+        g=g.clone(),
+        do=do.clone(),
+        num_householder=num_householder
+    )
     
-    # Compute du_direct using chunk_bwd_dv_local
-    du_direct = chunk_bwd_dv_local(
+    # # Compute dh, dh0, du_final using chunk_gated_delta_rule_bwd_dhu
+    dh, dh0, du_final = chunk_gated_delta_rule_bwd_dhu(
         q=q_expanded,
         k=k,
+        w=w,
         g=g_expanded,
+        h0=h0,
+        dht=dht,
         do=do_expanded,
+        dv=du_direct,
         scale=scale,
         cu_seqlens=None,
         chunk_size=128,
     )
-    print(f"[TEST] du_direct shape: {du_direct.shape}")
+
+    ds_next = dht  # This represents the gradient of the final hidden state
     
-    # # Compute dh, dh0, du_final using chunk_gated_delta_rule_bwd_dhu
-    # dh, dh0, du_final = chunk_gated_delta_rule_bwd_dhu(
-    #     q=q_expanded,
-    #     k=k,
-    #     w=w,
-    #     g=g_expanded,
-    #     h0=h0,
-    #     dht=dht,
-    #     do=do_expanded,
-    #     dv=du_direct,
-    #     scale=scale,
-    #     cu_seqlens=None,
-    #     chunk_size=128,
-    # )
-    # print(f"[TEST] du_final shape: {du_final.shape}, dh shape: {dh.shape}")
-    
-    # Create ds_final (state gradients per chunk) - use dh reshaped
-    num_chunks = math.ceil(T_expanded / 64)  # Using chunk size 64
-    ds_final_expanded = torch.randn(B, num_chunks, H, D, D, dtype=dtype, device=device)
-    ds_final = ds_final_expanded[:, ::num_householder]
-    
-    # Create state tensor (s) - internal states per chunk  
-    s = torch.randn(B, num_chunks, H, D, D, dtype=dtype, device=device)
-    
-    print(f"[TEST] ds_final shape: {ds_final.shape}, s shape: {s.shape}")
-    
-    # Initialize du_final randomly for testing
-    du_final = torch.randn_like(du_direct)
-    print(f"[TEST] du_final shape: {du_final.shape}")
-    
-    # Step 6: Test helper function 3 directly (zero gating)
-    print("[TEST] Testing helper function 3 directly (zero gating)...")
-    
+    du_final_naive, ds_final_naive = helper_final_gradient_s_and_u(
+        q=q,
+        k=k,
+        w=w,
+        du_direct=du_direct,
+        do=do,
+        ds_next=ds_next,
+        g=g,  
+        g_expanded=g_expanded,
+        num_householder=num_householder
+    )
+
+    print("[TEST] Make sure that intermediate gradients are correct")
+    assert_close('du_final', du_final, du_final_naive, 0.01)
+    assert_close('ds_final', dh0, ds_final_naive[:, 0], 0.01)
+
+    print("[TEST] Testing helper_gradient_qwkg...")
+
     dq_naive, dw_naive, dk_naive, dg_expanded_naive = helper_gradient_qwkg(
         q=q,  # Use original q, not expanded
         k=k,
         v_new=v_new,
         w=w,
         g=g,  # Zero gating (cumsum of zeros)
-        s=s,
-        ds_final=ds_final,
+        # s=h[:, ::num_householder], # TODO check 
+        s=h, 
+        ds_final=ds_final_naive,
         dht=dht,
         do=do,  # Use original do, not expanded
         du_final=du_final,
@@ -845,32 +843,29 @@ def test_helper3_gradient_qwkg_comparison(
         v=v_new,
         do=do_expanded,
         h=s,
-        dh=ds_final_expanded,  
+        dh=dh,  
         g=None,  # No gating
         dv=du_final,
         w=w,
         scale=scale,
     )
+
+    # Step 8: Compare the outputs (adjust shapes as needed)
     
     print(f"[TEST] dq_tri shape: {dq_tri.shape}")
     print(f"[TEST] dq_tri values: min={dq_tri.min():.6f}, max={dq_tri.max():.6f}, has_nan={torch.isnan(dq_tri).any()}")
+
+    # assert_close('dq', dq_tri, dq_naive, 0.01)
+    # print("[TEST] dq comparison passed!")
+
     print(f"[TEST] dk_tri shape: {dk_tri.shape}")
     print(f"[TEST] dk_tri values: min={dk_tri.min():.6f}, max={dk_tri.max():.6f}, has_nan={torch.isnan(dk_tri).any()}")
     
-    print(f"[TEST] dw_tri shape: {dw_tri.shape}")
-    print(f"[TEST] dw_tri values: min={dw_tri.min():.6f}, max={dw_tri.max():.6f}, has_nan={torch.isnan(dw_tri).any()}")
-    
-    # Step 8: Compare the outputs (adjust shapes as needed)
-    print("[TEST] Comparing gradient outputs...")
-        
-    # Compare dq (need to extract from expanded version)
-    dq_tri_reshaped = dq_tri[:, ::num_householder]  # Extract true timesteps
-    # assert_close('dq', dq_tri_reshaped, dq_naive, 0.01)
-    # print("[TEST] dq comparison passed!")
-    
-    # Compare dk (same shape)
     # assert_close('dk', dk_tri, dk_naive, 0.01)
     # print("[TEST] dk comparison passed!")
+
+    print(f"[TEST] dw_tri shape: {dw_tri.shape}")
+    print(f"[TEST] dw_tri values: min={dw_tri.min():.6f}, max={dw_tri.max():.6f}, has_nan={torch.isnan(dw_tri).any()}")
     
     # Compare dw if available
     assert_close('dw', dw_tri, dw_naive, 0.01)
