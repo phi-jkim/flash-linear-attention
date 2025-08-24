@@ -448,7 +448,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
         # Mark unused variables to avoid warnings
         _ = k_chunk, w_chunk
 
-        # ds_chunk_next can be dht 
+        # ds_final is stored as ds_1, ... , dht same as triton implementation of dh
         ds_chunk = ds_final[:, chunk_idx]  # (B, H, K, V) 
         if chunk_idx + 1 < num_chunks:
             ds_chunk_next = ds_final[:, chunk_idx + 1]  # (B, H, K, V)
@@ -460,12 +460,13 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
 
         print(f"[HELPER3] Gradient chunks: ds_chunk={ds_chunk.shape}, ds_chunk_next={ds_chunk_next.shape}")
 
-        # TODO need to also account for b_dg_last of b dh 
         # add to dg_expanded
         # S[t] = 1/exp(g[t+N-1]) * \arrow{S}[t]
         # dL/d g[t+N-1] = dL/dS[t] * \arrow{S}[t] * (- 1/exp(g[t+N-1]))  
         # (B,H,K,V) -> (B,H) by summing dim 2 and 3 
-        dg_contrib = (ds_chunk * gated_s_chunk * - (1/g_expanded[:, expanded_end-1, :, None, None].exp())).sum(dim=(2,3))
+        # dg_contrib = (ds_chunk * gated_s_chunk * - (1/g_expanded[:, expanded_end-1, :, None, None].exp())).sum(dim=(2,3))
+        # TODO check if correct
+        dg_contrib = (ds_chunk_next * s_chunk) * (g_expanded[:, expanded_end-1, :, None, None].exp()).sum(dim=(2,3))
         print(f"[HELPER3] Computing dg contribution: {dg_contrib.shape}")
         dg_expanded[:, expanded_end-1, :] += dg_contrib
         
@@ -705,7 +706,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
 
 
 # Helper Function 4: Hidden gradient computation for K[t], g, V[t], β[t] (PDF Section 4)
-def helper_hidden_gradient_kvgb(k, g_expanded, v, beta, dk_direct, dg_expanded_direct, dw, du, A):
+def helper_hidden_gradient_kvgb(k, g_expanded, v, beta, dk_direct, dg_expanded_direct, dw, du, A, num_householder):
     """
     Compute hidden gradients for K, g, V, β following PDF Section 4.
     Calls prepare_wy_repr_bwd and accumulates gradients as in chunk_gated_delta_rule_bwd.
@@ -906,7 +907,7 @@ def gated_naive_torch_delta_product_bwd(
     # Step 4: Compute hidden gradients using Helper Function 4 and add to direct gradients of dk and dg 
     print(f"[MAIN_BWD] Step 4: Calling helper_hidden_gradient_kvgb")
     dk_final, dg_final, dv_final, dbeta_final = helper_hidden_gradient_kvgb(
-        k, g_expanded, v, beta, dk_direct, dg_expanded_direct, dw, du_final, v A
+        k, g_expanded, v, beta, dk_direct, dg_expanded_direct, dw, du_final, A, num_householder
     )
     print(f"[MAIN_BWD] Step 4 completed: dk_final={dk_final.shape}, dg_final={dg_final.shape}")
     print(f"[MAIN_BWD] Step 4 completed: dv_final={dv_final.shape}, dbeta_final={dbeta_final.shape}")
