@@ -270,6 +270,8 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
+        # Jinha: i_n is which batch, bos is which token 
+        # boh is which state 
         bos, eos = i_n * T, i_n * T + T
         NT = tl.cdiv(T, BT)
         boh = i_n * NT
@@ -313,11 +315,6 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             b_dh4 += tl.load(p_dht4, boundary_check=(0, 1))
 
     for i_t in range(NT - 1, -1, -1):
-        # TODO: Jinha: maybe we should store this at the end of the loop 
-        # or otherwise will store for the gradients of h as dht at i_t = NT - 1 
-        # and then dht + gradient of h from last Ot for next iteration (not sure if this is desired)
-        # is dh intended to be dht, then dS_last, dS_last-1 ... dS1 and dh0 is dS0 intended
-
         p_dh1 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         tl.store(p_dh1, b_dh1.to(p_dh1.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:

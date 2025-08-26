@@ -466,7 +466,7 @@ def helper_gradient_qwkg(q, k, v_new, w, g, s, ds_final, dht, do, du_final,
         # (B,H,K,V) -> (B,H) by summing dim 2 and 3 
         # dg_contrib = (ds_chunk * gated_s_chunk * - (1/g_expanded[:, expanded_end-1, :, None, None].exp())).sum(dim=(2,3))
         # TODO check if correct
-        dg_contrib = (ds_chunk_next * s_chunk) * (g_expanded[:, expanded_end-1, :, None, None].exp()).sum(dim=(2,3))
+        dg_contrib = ((ds_chunk_next * s_chunk) * g_expanded[:, expanded_end-1, :, None, None].exp()).sum(dim=(2,3))
         print(f"[HELPER3] Computing dg contribution: {dg_contrib.shape}")
         dg_expanded[:, expanded_end-1, :] += dg_contrib
         

@@ -93,6 +93,109 @@ def chunk_gated_delta_product_fwd(
     return g, g_interleaved, o, A, final_state
 
 
+def chunk_gated_delta_product_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    do: torch.Tensor,
+    dht: torch.Tensor,
+    cu_seqlens: Optional[torch.LongTensor] = None,
+    num_householder: int = 1,
+):
+    """
+    Optimized backward pass for gated delta product that uses specific subfunctions
+    instead of relying on the generic gated delta rule backward pass.
+    
+    This function implements the backward computation by:
+    1. Recomputing forward pass intermediate values (w, u, h, v_new)
+    2. Computing gradients using optimized delta product specific kernels
+    3. Handling the multi-householder transformation efficiently
+    """
+    from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu
+    from fla.ops.common.chunk_o import chunk_bwd_dv_local, chunk_bwd_dqkwg
+    
+    cu_seqlens_dp = cu_seqlens * num_householder if cu_seqlens is not None else None
+    
+    # Step 1: Recompute w, u from the forward pass
+    if g is not None:
+        w, u = gdn_recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g=g,
+            cu_seqlens=cu_seqlens_dp,
+        )
+    else:
+        w, u = dn_recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            cu_seqlens=cu_seqlens_dp,
+        )
+    
+    # Step 2: Recompute h, v_new from the forward pass
+    h, v_new, _ = chunk_gated_delta_product_fwd_h(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        initial_state=initial_state,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens_dp,
+        num_householder=num_householder,
+    )
+    
+    # Step 3: Compute du_direct using the delta product specific kernel
+    du_direct = chunk_bwd_dv_local(
+        q=q,
+        k=k,
+        g=g,
+        do=do,
+        scale=scale,
+        cu_seqlens=cu_seqlens_dp,
+    )
+    
+    # Step 4: Compute dh, dh0, du_final using the gated delta rule kernel
+    dh, dh0, du_final = chunk_gated_delta_rule_bwd_dhu(
+        q=q,
+        k=k,
+        w=w,
+        g=g,
+        h0=initial_state,
+        dht=dht,
+        do=do,
+        dv=du_direct,
+        scale=scale,
+        cu_seqlens=cu_seqlens_dp,
+    )
+    
+    # Step 5: Compute dq, dk, dw, dg using the optimized QKWG kernel
+    dq, dk, dw, dg_expanded = chunk_bwd_dqkwg(
+        q=q,
+        k=k,
+        v=v_new,
+        do=do,
+        h=h,
+        dh=dh,
+        g=g,
+        dv=du_final,
+        w=w,
+        scale=scale,
+    )
+    
+    # Step 6: Convert du_final to dbeta using the relationship beta * du_final
+    # This follows the chain rule for the beta parameter in the WY representation
+    db = (beta.unsqueeze(-1) * du_final).sum(dim=-1)
+    
+    return dq, dk, dw, db, dg_expanded, dh0
+
 class ChunkGatedDeltaProductFunction(torch.autograd.Function):
 
     @staticmethod
