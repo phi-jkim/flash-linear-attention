@@ -128,7 +128,7 @@ def chunk_gated_delta_product_bwd(
             v=v,
             beta=beta,
             A=A,
-            g=g,
+            g=g, # replace with g_interleaved 
             cu_seqlens=cu_seqlens_dp,
         )
     else:
@@ -145,7 +145,7 @@ def chunk_gated_delta_product_bwd(
         k=k,
         w=w,
         u=u,
-        g=g,
+        g=g, # replace with g_interleaved
         initial_state=initial_state,
         output_final_state=False,
         cu_seqlens=cu_seqlens_dp,
@@ -156,7 +156,7 @@ def chunk_gated_delta_product_bwd(
     du_direct = chunk_bwd_dv_local(
         q=q,
         k=k,
-        g=g,
+        g=g, # replace with g
         do=do,
         scale=scale,
         cu_seqlens=cu_seqlens_dp,

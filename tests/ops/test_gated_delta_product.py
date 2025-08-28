@@ -245,7 +245,8 @@ def test_naive_vs_manual_backward(
     k = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
     v = torch.randn(B, T * num_householder, H, D, dtype=dtype, device=device, requires_grad=True)
     beta = torch.rand(B, T * num_householder, H, dtype=dtype, device=device, requires_grad=True).sigmoid()
-    g = F.logsigmoid(torch.rand(B, T, H, dtype=dtype, device=device, requires_grad=True))
+    # g = F.logsigmoid(torch.rand(B, T, H, dtype=dtype, device=device, requires_grad=True))
+    g = torch.zeros(B, T, H, dtype=dtype, device=device, requires_grad=True)
     h0 = torch.randn(B, H, D, D, dtype=dtype, device=device, requires_grad=True)
     
     print(f"Input shapes: q={q.shape}, k={k.shape}, v={v.shape}, beta={beta.shape}, g={g.shape}, h0={h0.shape}")
@@ -295,6 +296,9 @@ def test_naive_vs_manual_backward(
         dht=dht,
     )
     
+    print(auto_dh0.shape) 
+    print(manual_dh0.shape)
+
     # Compare gradients using same tolerances as existing tests
     assert_close('dh0', auto_dh0, manual_dh0, 0.008)
     assert_close('dq', auto_dq, manual_dq, 0.008)

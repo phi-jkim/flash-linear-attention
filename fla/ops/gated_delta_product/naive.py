@@ -127,7 +127,7 @@ def helper_direct_gradient_u_minus_ws(q, k, do, g, num_householder):
         
         print(f"[HELPER1] Extracted chunks: q_chunk={q_chunk.shape}, k_chunk={k_chunk.shape}, do_chunk={do_chunk.shape}")
 
-        # TODO chec kthat q_chunk and k_chunk have same dimensions (can have different chunk dimensions other than dk)
+        # TODO check that q_chunk and k_chunk have same dimensions (can have different chunk dimensions other than dk)
 
         # TODO implement iterating over separating DK as well 
         
@@ -915,7 +915,9 @@ def gated_naive_torch_delta_product_bwd(
     # assert dg_final.dtype == torch.float32, "dg should be fp32"
     dg_final = chunk_local_cumsum(dg_final, chunk_size=64, reverse=True)
 
-    ds0 = ds_final[:, 0].T
+    ds0 = ds_final[:, 0].transpose(-1, -2)
+
+    # ds_final=torch.Size([1, 1, 2, 16, 16])
     # only the first hidden state gradient needs to be returned ds0 for computing gradient of previous chunk 
     
     # Return in the expected order: (dq, dk, dv, dg, dbeta, dh0)
