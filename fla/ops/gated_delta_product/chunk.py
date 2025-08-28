@@ -369,6 +369,8 @@ class ChunkGatedDeltaProductFunction(torch.autograd.Function):
             num_householder=ctx.num_householder,
         )
 
+        dq = rearrange(dq, 'b (l n) h d -> b l n h d', n=ctx.num_householder)[:, :, -1].contiguous()
+        
         # if use_qk_l2norm_in_kernel, do l2norm_bwd (calculate gradient for l2norm)
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)
