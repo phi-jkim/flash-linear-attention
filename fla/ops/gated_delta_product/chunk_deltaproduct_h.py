@@ -238,18 +238,24 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
+    # i_n corresponds to batch and i_h corresponds to head
 
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
+        T = eos - bos # expanded tokens 
         NT = tl.cdiv(T, BT)
-        boh = tl.load(chunk_offsets + i_n).to(tl.int32)
+        # boh corresponds to 
+        boh = tl.load(chunk_offsets + i_n).to(tl.int32) 
+        # TODO: for each i_n in chunk_offsets, store index for which BT * num householder chunk 
+        # for each batch 
     else:
         bos, eos = i_n * T, i_n * T + T
         NT = tl.cdiv(T, BT)
         # boh = i_n * tl.cdiv(T, BT)
         # Jinha: update boh to match the chunk_gated_delta_product_fwd_kernel_h_blockdim64 implementation
-        boh = i_n * tl.cdiv(T // num_householder, BT)
+        NT_TRUE = tl.cdiv(T // num_householder, BT) 
+        boh = i_n * tl.cdiv(T // num_householder, BT) 
+        # each batch has (T / (num householder * BT)) chunks 
 
     # [BK, BV]
     b_dh1 = tl.zeros([64, BV], dtype=tl.float32)
@@ -258,7 +264,13 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
     if K > 128:
         b_dh3 = tl.zeros([64, BV], dtype=tl.float32)
     if K > 192:
-        b_dh4 = tl.zeros([64, BV], dtype=tl.float32)
+        b_dh4 = tl.zeros([64, BV], dtype=tl.float32) 
+        
+    # q is (B, T_true, H, K)
+    # o is (B, T_true, H, V)
+    # do is (B, T_true, H, V) 
+    # h is (B, T_actual, H, K, V) 
+    # dh is (B, \ceil(T_true / BT), H, K, V)
 
     # calculate offset
     dh += (boh * H + i_h) * K*V
@@ -276,6 +288,8 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
     if USE_FINAL_STATE_GRADIENT:
         dht += i_nh * K*V
 
+    # dh0, dh1, dh2 ..., dht, (dht should always exist at the end)
+
     if USE_FINAL_STATE_GRADIENT:
         p_dht1 = tl.make_block_ptr(dht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         b_dh1 += tl.load(p_dht1, boundary_check=(0, 1))
@@ -289,26 +303,71 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
             p_dht4 = tl.make_block_ptr(dht, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
             b_dh4 += tl.load(p_dht4, boundary_check=(0, 1))
 
-    for i_t in range(NT - 1, -1, -1):
-        p_dh1 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-        tl.store(p_dh1, b_dh1.to(p_dh1.dtype.element_ty), boundary_check=(0, 1))
-        if K > 64:
-            p_dh2 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
-            tl.store(p_dh2, b_dh2.to(p_dh2.dtype.element_ty), boundary_check=(0, 1))
-        if K > 128:
-            p_dh3 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0))
-            tl.store(p_dh3, b_dh3.to(p_dh3.dtype.element_ty), boundary_check=(0, 1))
-        if K > 192:
-            p_dh4 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
-            tl.store(p_dh4, b_dh4.to(p_dh4.dtype.element_ty), boundary_check=(0, 1))
+    # ceil (NT // num_householder)
+    p_dh1 = tl.make_block_ptr(dh + (NT_TRUE-1)*stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
+    tl.store(p_dh1, b_dh1.to(p_dh1.dtype.element_ty), boundary_check=(0, 1))
+    if K > 64:
+        p_dh2 = tl.make_block_ptr(dh + (NT_TRUE-1)*stride_h, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
+        tl.store(p_dh2, b_dh2.to(p_dh2.dtype.element_ty), boundary_check=(0, 1))
+    if K > 128:
+        p_dh3 = tl.make_block_ptr(dh + (NT_TRUE-1)*stride_h, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0))
+        tl.store(p_dh3, b_dh3.to(p_dh3.dtype.element_ty), boundary_check=(0, 1))
+    if K > 192:
+        p_dh4 = tl.make_block_ptr(dh + (NT_TRUE-1)*stride_h, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
+        tl.store(p_dh4, b_dh4.to(p_dh4.dtype.element_ty), boundary_check=(0, 1))
+
+    # make copies of b_dh 
+    b_dh1_cpy = b_dh1.copy()
+    if K > 64:
+        b_dh2_cpy = b_dh2.copy()
+    if K > 128:
+        b_dh3_cpy = b_dh3.copy()
+    if K > 192:
+        b_dh4_cpy = b_dh4.copy()
+
+    NEW_BLOCK_BT_EXPANDED = True # flag to check if we are in a new BT * num_householder chunk
+
+    for i_t in range(NT - 1, -1, -1): 
+        # # TODO store every BT * num_householder chunks 
+        # if i_t % num_householder == 0: 
+        #     p_dh1 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
+        #     tl.store(p_dh1, b_dh1.to(p_dh1.dtype.element_ty), boundary_check=(0, 1))
+        #     if K > 64:
+        #         p_dh2 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
+        #         tl.store(p_dh2, b_dh2.to(p_dh2.dtype.element_ty), boundary_check=(0, 1))
+        #     if K > 128:
+        #         p_dh3 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0))
+        #         tl.store(p_dh3, b_dh3.to(p_dh3.dtype.element_ty), boundary_check=(0, 1))
+        #     if K > 192:
+        #         p_dh4 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
+        #         tl.store(p_dh4, b_dh4.to(p_dh4.dtype.element_ty), boundary_check=(0, 1))
+
+        i_th = i_t // num_householder
+        i_th_rem = i_t % num_householder
+
+        # TODO use g which is t_true and index by i_t // (BT * num householder)
+        # if USE_G:
+        #     last_idx = min((i_t + 1) * BT, T) - 1
+        #     bg_last = tl.load(g + (bos + last_idx) * H + i_h)
+        #     bg_last_exp = exp(bg_last)
+        #     p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+        #     b_g = tl.load(p_g, boundary_check=(0,))
+        #     b_g_exp = exp(b_g)
+        # else:
+        #     bg_last = None
+        #     last_idx = None
+        #     b_g = None
+        #     b_g_exp = None
 
         if USE_G:
-            last_idx = min((i_t + 1) * BT, T) - 1
+            last_idx = min((i_th + 1) * BT, T_true) - 1
             bg_last = tl.load(g + (bos + last_idx) * H + i_h)
             bg_last_exp = exp(bg_last)
-            p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+            p_g = tl.make_block_ptr(g + bos * H + i_h, (T_true,), (H,), (i_th * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
             b_g_exp = exp(b_g)
+            b_g_interleaved = b_g[tl.arange(0, BT*num_householder) // num_householder]
+            b_g_interleaved = b_g_interleaved[i_th_rem*BT:(i_th_rem+1)*BT]
         else:
             bg_last = None
             last_idx = None
@@ -316,82 +375,132 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
             b_g_exp = None
 
         p_dv = tl.make_block_ptr(dv, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_do = tl.make_block_ptr(do, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        # p_do = tl.make_block_ptr(do, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_do = tl.make_block_ptr(do, (T_true, V), (stride_v, 1), (i_th * BT, i_v * BV), (BT, BV), (1, 0))
         p_dv2 = tl.make_block_ptr(dv2, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
 
         b_do = tl.load(p_do, boundary_check=(0, 1))
         b_dv = tl.zeros([BT, BV], dtype=tl.float32)
+        # block multiplication of b_k and b_dh to get b_dv 
 
         # Update dv based on hidden state gradients
         p_k = tl.make_block_ptr(k, (T, K), (stride_k, 1), (i_t * BT, 0), (BT, 64), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_dv += tl.dot(b_k, b_dh1.to(b_k.dtype))
+        # b_dv += tl.dot(b_k, b_dh1.to(b_k.dtype))
+        b_dv += tl.dot(b_k, b_dh1_cpy.to(b_k.dtype))
 
         if K > 64:
             p_k = tl.make_block_ptr(k, (T, K), (stride_k, 1), (i_t * BT, 64), (BT, 64), (1, 0))
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_dv += tl.dot(b_k, b_dh2.to(b_k.dtype))
+            # b_dv += tl.dot(b_k, b_dh2.to(b_k.dtype))
+            b_dv += tl.dot(b_k, b_dh2_cpy.to(b_k.dtype))
 
         if K > 128:
             p_k = tl.make_block_ptr(k, (T, K), (stride_k, 1), (i_t * BT, 128), (BT, 64), (1, 0))
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_dv += tl.dot(b_k, b_dh3.to(b_k.dtype))
+            # b_dv += tl.dot(b_k, b_dh3.to(b_k.dtype))
+            b_dv += tl.dot(b_k, b_dh3_cpy.to(b_k.dtype))
 
         if K > 192:
             p_k = tl.make_block_ptr(k, (T, K), (stride_k, 1), (i_t * BT, 192), (BT, 64), (1, 0))
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_dv += tl.dot(b_k, b_dh4.to(b_k.dtype))
+            # b_dv += tl.dot(b_k, b_dh4.to(b_k.dtype))
+            b_dv += tl.dot(b_k, b_dh4_cpy.to(b_k.dtype))
 
         if USE_G:
-            m_t = (i_t * BT + tl.arange(0, BT)) < T
-            b_dv *= tl.where(m_t, exp(bg_last - b_g), 0)[:, None]
+            m_t = (i_t * BT + tl.arange(0, BT)) < T 
+            # TODO use b_g 
+            # b_dv *= tl.where(m_t, exp(bg_last - b_g), 0)[:, None] 
+            b_dv *= tl.where(m_t, exp(bg_last - b_g_interleaved), 0)[:, None] 
         b_dv += tl.load(p_dv, boundary_check=(0, 1))
 
         tl.store(p_dv2, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
         # Update hidden state gradients
         p_w = tl.make_block_ptr(w, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1))
-        p_q = tl.make_block_ptr(q, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1))
+        # p_q = tl.make_block_ptr(q, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1))
+        p_q = tl.make_block_ptr(q, (K, T_true), (1, stride_k), (0, i_th * BT), (64, BT), (0, 1))
         b_w = tl.load(p_w, boundary_check=(0, 1))
         b_q = tl.load(p_q, boundary_check=(0, 1))
-        if USE_G:
-            b_dh1 *= bg_last_exp
-            b_q = b_q * b_g_exp[None, :]
-        b_q = (b_q * scale).to(b_q.dtype)
-        b_dh1 += tl.dot(b_q, b_do.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype))
+        if NEW_BLOCK_BT_EXPANDED:
+            if USE_G:
+                b_dh1 *= bg_last_exp
+                b_q = b_q * b_g_exp[None, :]
+            b_q = (b_q * scale).to(b_q.dtype)
+
+            # TODO increment b_q @ b_do only once for each BT * num_householder chunk (check by dividing)
+            # TODO block sum of b_w, b_dv 
+            b_dh1 += tl.dot(b_q, b_do.to(b_q.dtype)) 
+
+        b_dh1 -= tl.dot(b_w, b_dv.to(b_w.dtype))
 
         if K > 64:
             p_q = tl.make_block_ptr(q, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1))
             p_w = tl.make_block_ptr(w, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1))
             b_q = tl.load(p_q, boundary_check=(0, 1))
             b_w = tl.load(p_w, boundary_check=(0, 1))
-            if USE_G:
-                b_dh2 *= bg_last_exp
-                b_q = b_q * b_g_exp[None, :]
-            b_q = (b_q * scale).to(b_q.dtype)
-            b_dh2 += tl.dot(b_q, b_do.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype))
+            if NEW_BLOCK_BT_EXPANDED:
+                if USE_G:
+                    b_dh2 *= bg_last_exp
+                    b_q = b_q * b_g_exp[None, :]
+                b_q = (b_q * scale).to(b_q.dtype)
+                b_dh2 += tl.dot(b_q, b_do.to(b_q.dtype)) 
+            b_dh2 -= tl.dot(b_w, b_dv.to(b_w.dtype))
 
         if K > 128:
             p_q = tl.make_block_ptr(q, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1))
             p_w = tl.make_block_ptr(w, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1))
             b_q = tl.load(p_q, boundary_check=(0, 1))
             b_w = tl.load(p_w, boundary_check=(0, 1))
-            if USE_G:
-                b_dh3 *= bg_last_exp
-                b_q = b_q * b_g_exp[None, :]
-            b_q = (b_q * scale).to(b_q.dtype)
-            b_dh3 += tl.dot(b_q, b_do.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype))
+            if NEW_BLOCK_BT_EXPANDED:
+                if USE_G:
+                    b_dh3 *= bg_last_exp
+                    b_q = b_q * b_g_exp[None, :]
+                b_q = (b_q * scale).to(b_q.dtype)
+                b_dh3 += tl.dot(b_q, b_do.to(b_q.dtype)) 
+            b_dh3 -= tl.dot(b_w, b_dv.to(b_w.dtype))
 
         if K > 192:
             p_q = tl.make_block_ptr(q, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1))
             p_w = tl.make_block_ptr(w, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1))
             b_q = tl.load(p_q, boundary_check=(0, 1))
             b_w = tl.load(p_w, boundary_check=(0, 1))
-            if USE_G:
-                b_dh4 *= bg_last_exp
-                b_q = b_q * b_g_exp[None, :]
-            b_q = (b_q * scale).to(b_q.dtype)
-            b_dh4 += tl.dot(b_q, b_do.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype))
+            if NEW_BLOCK_BT_EXPANDED:
+                if USE_G:
+                    b_dh4 *= bg_last_exp
+                    b_q = b_q * b_g_exp[None, :]
+                b_q = (b_q * scale).to(b_q.dtype)
+                b_dh4 += tl.dot(b_q, b_do.to(b_q.dtype)) 
+            b_dh4 -= tl.dot(b_w, b_dv.to(b_w.dtype))
+
+        NEW_BLOCK_BT_EXPANDED = False 
+
+        # TODO store every BT * num_householder chunks 
+        # don't store initial state 
+
+        if i_t % num_householder == 0 and i_t > 0: 
+            NEW_BLOCK_BT_EXPANDED = True 
+            p_dh1 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
+            tl.store(p_dh1, b_dh1.to(p_dh1.dtype.element_ty), boundary_check=(0, 1))
+            if K > 64:
+                p_dh2 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
+                tl.store(p_dh2, b_dh2.to(p_dh2.dtype.element_ty), boundary_check=(0, 1))
+            if K > 128:
+                p_dh3 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0))
+                tl.store(p_dh3, b_dh3.to(p_dh3.dtype.element_ty), boundary_check=(0, 1))
+            if K > 192:
+                p_dh4 = tl.make_block_ptr(dh + i_t*stride_h, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
+                tl.store(p_dh4, b_dh4.to(p_dh4.dtype.element_ty), boundary_check=(0, 1))
+
+            # make copies of b_dh 
+            b_dh1_cpy = b_dh1.copy()
+            if K > 64:
+                b_dh2_cpy = b_dh2.copy()
+            if K > 128:
+                b_dh3_cpy = b_dh3.copy()
+            if K > 192:
+                b_dh4_cpy = b_dh4.copy()
+
 
     if USE_INITIAL_STATE:
         p_dh0 = tl.make_block_ptr(dh0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
@@ -471,23 +580,24 @@ def chunk_gated_delta_product_bwd_dhu(
     chunk_size: int = 64,
     num_householder: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    B, T, H, K, V = *q.shape, do.shape[-1]
+    B, T, H, K, V = *k.shape, do.shape[-1]
     assert T % num_householder == 0, "T must be divisible by num_householder"
-    T_true = T // num_householder
 
     # N: the actual number of sequences in the batch with either equal or variable lengths
     BT = 64
     assert K <= 256, "current kernel does not support head dimension being larger than 256."
 
-    chunk_indices = prepare_chunk_indices(cu_seqlens // num_householder, chunk_size) if cu_seqlens is not None else None
+    # Jinha: each index in cu_seqlens is expected to be divisible by num householder 
+    chunk_indices = prepare_chunk_indices(cu_seqlens // num_householder, BT) if cu_seqlens is not None else None
     if cu_seqlens is None:
-        N, NT, chunk_offsets = B, triton.cdiv(T_true, BT), None
+        N, NT, chunk_offsets = B, triton.cdiv(T // num_householder, BT), None
     else:
         N, NT, chunk_offsets = (
             len(cu_seqlens) - 1, len(chunk_indices),
             prepare_chunk_offsets(cu_seqlens // num_householder, BT)
         )
 
+    # each NT block corresponds to num_householder * BT 
     dh = q.new_empty(B, NT, H, K, V)
     dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
     dv2 = torch.empty_like(dv)
@@ -517,3 +627,4 @@ def chunk_gated_delta_product_bwd_dhu(
     # could call chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64 instead
     # after adjusting number of tokens
     return dh, dh0, dv2
+
