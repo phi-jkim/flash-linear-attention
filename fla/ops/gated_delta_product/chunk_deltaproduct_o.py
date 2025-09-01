@@ -178,7 +178,7 @@ def chunk_gated_delta_product_bwd_dv_local(
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    dv = torch.zeros((B, T, H, V), dtype=torch.float32, device=k.device)
+    dv = torch.zeros((B, T, H, V), dtype=do.dtype, device=do.device)
     grid = (NT, B * H)
     chunk_gated_delta_product_bwd_kernel_dv_local[grid](
         q=q,
@@ -307,17 +307,21 @@ def chunk_gated_delta_product_bwd_kernel_dv_local(
     
     if USE_G:
         # BT x BT 
-        g_mask = (b_g[:, None] - b_g[None, :]) 
+        # g_mask = (b_g[:, None] - b_g[None, :]) 
         # g_mask = g_mask.repeat_interleave(num_householder, dim=1)
         # g_mask = tl.trans(g_mask[:, i_BT*BT:(i_BT+1)*BT]) 
-        ones3d = tl.zeros([BT, BT, num_householder], dtype=g_mask.dtype) + 1
-        g_mask_expanded = tl.reshape(g_mask[:, :, None] * ones3d, [BT, BT * num_householder])
 
-        start = i_BT * BT
-        cols  = start + tl.arange(0, BT)        # shape [BT]
-        g_mask_expanded = tl.trans(g_mask_expanded[:, cols])   # shape [BT, BT]
+        col_idx = (i_BT * BT + tl.arange(0, BT)) // num_householder   # base column each expanded col maps to, [BT], int32
 
-        b_A = tl.where(m_A_reduced, b_A * exp(g_mask_expanded) * scale, 0).to(do.dtype.element_ty)
+        cols = tl.arange(0, BT)[:, None]                    # [BT, 1]
+        S = (cols == col_idx[None, :]).to(b_A.dtype)         # [BT, BT], bool
+
+        bg_cols = tl.sum((b_g[:, None] * S), axis=0)     # [BT]
+
+        g_mask_block = (b_g[:, None] - bg_cols[None, :]).to(b_A.dtype)   # [BT, BT]
+        g_mask_block_T = tl.trans(g_mask_block)                               # [BT, BT]
+
+        b_A = tl.where(m_A_reduced, b_A * tl.exp(g_mask_block_T) * scale, 0).to(do.dtype.element_ty)
     else:
         b_A = tl.where(m_A_reduced, b_A * scale, 0).to(do.dtype.element_ty)
 
