@@ -309,8 +309,8 @@ def chunk_gated_delta_product_bwd(
         dg_final.add_(dg_local)  # dL/dg = dL/dO * dO/dg + dL/dO * dO/dv_new * dv_new/dg = dg_local + dg2
         assert dg_final.dtype == torch.float32, "dg_final should be fp32"
         from fla.ops.utils import chunk_local_cumsum
-        # dg_final = chunk_local_cumsum(dg_final, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens_dp)
-        dg_final = chunk_local_cumsum(dg_final, chunk_size=64*num_householder, reverse=True, cu_seqlens=cu_seqlens_dp)
+        dg_final = chunk_local_cumsum(dg_final, chunk_size=16, reverse=True, cu_seqlens=cu_seqlens_dp)
+        # dg_final = chunk_local_cumsum(dg_final, chunk_size=64*num_householder, reverse=True, cu_seqlens=cu_seqlens_dp)
 
         # Convert interleaved gating gradients back to original format
         dg_final = rearrange(dg_final, 'b (l n) h -> b l n h', n=num_householder)[:, :, 0].contiguous()
