@@ -178,7 +178,7 @@ def chunk_gated_delta_product_bwd_dv_local(
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    dv = torch.zeros((B, T, H, V), dtype=do.dtype, device=do.device)
+    dv = torch.empty((B, T, H, V), dtype=do.dtype, device=do.device)
     grid = (NT, B * H)
     chunk_gated_delta_product_bwd_kernel_dv_local[grid](
         q=q,
@@ -298,7 +298,7 @@ def chunk_gated_delta_product_bwd_kernel_dv_local(
     # m_A = (o_t[:, None] <= o_t[None, :]) & (m_t[:, None] & m_t)
     # m_A_reduced = m_A[i_BT*BT:(i_BT+1)*BT, num_householder-1::num_householder]
     
-    o_t_rows = i_tq_o * BT * num_householder + i_BT * BT + tl.arange(0, BT)
+    o_t_rows = i_tq_o * BT * num_householder + i_BT * BT + tl.arange(0, BT) # i_T * BT + tl.arange(0, BT)
     o_t_cols = i_tq_o * BT * num_householder + (num_householder - 1) + tl.arange(0, BT) * num_householder
     
     m_t_rows = o_t_rows < T
@@ -311,17 +311,18 @@ def chunk_gated_delta_product_bwd_kernel_dv_local(
         # g_mask = g_mask.repeat_interleave(num_householder, dim=1)
         # g_mask = tl.trans(g_mask[:, i_BT*BT:(i_BT+1)*BT]) 
 
+        # TODO instead load this from memory 
         col_idx = (i_BT * BT + tl.arange(0, BT)) // num_householder   # base column each expanded col maps to, [BT], int32
 
         cols = tl.arange(0, BT)[:, None]                    # [BT, 1]
-        S = (cols == col_idx[None, :]).to(b_A.dtype)         # [BT, BT], bool
+        S = (cols == col_idx[None, :]).to(b_g.dtype)         # [BT, BT], bool
 
         bg_cols = tl.sum((b_g[:, None] * S), axis=0)     # [BT]
 
-        g_mask_block = (b_g[:, None] - bg_cols[None, :]).to(b_A.dtype)   # [BT, BT]
+        g_mask_block = (b_g[:, None] - bg_cols[None, :])  # [BT, BT]
         g_mask_block_T = tl.trans(g_mask_block)                               # [BT, BT]
 
-        b_A = tl.where(m_A_reduced, b_A * tl.exp(g_mask_block_T) * scale, 0).to(do.dtype.element_ty)
+        b_A = tl.where(m_A_reduced, b_A * exp(g_mask_block_T) * scale, 0).to(do.dtype.element_ty)
     else:
         b_A = tl.where(m_A_reduced, b_A * scale, 0).to(do.dtype.element_ty)
 
@@ -595,16 +596,17 @@ def chunk_bwd_kernel_dqkwg(
     i_k, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_tg = i_t
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         all = T
         T = eos - bos
+        i_tg = i_t
         NT = tl.cdiv(T, BT)
         # Calculate true sequence dimensions
         bos_q_o = bos // num_householder
         eos_q_o = eos // num_householder
         T_true = T // num_householder
+        boh = tl.cdiv(bos // num_householder, BT)
     else:
         NT = tl.cdiv(T, BT)
         i_tg = i_b * tl.cdiv(T // num_householder, BT) + i_t
@@ -614,20 +616,25 @@ def chunk_bwd_kernel_dqkwg(
         bos_q_o = bos // num_householder
         eos_q_o = eos // num_householder
         T_true = T // num_householder
+        # boh = tl.cdiv(bos // num_householder, BT)
+        boh = i_b * tl.cdiv(T // num_householder, BT) 
+
+    # TODO FIX I_T 
 
     # i_t corresponds to index of BT * num_householder chunk 
     # 
     i_tkw = i_t * num_householder
-    i_tg_expanded = i_tg * num_householder # TODO check 
     # index for which BT chunk current thread block corresponds in expanded sequence
     # i_BT = i_t % num_householder
 
     # offset calculation
-    v += (bos * H + i_h) * V
+    v += (bos * H + i_h) * V 
     do += (bos_q_o * H + i_h) * V  # do uses true sequence indexing
     # h0, use NT to get state for each num householder * BT 
-    h += (i_tg_expanded * H + i_h).to(tl.int64) * K*V
-    dh += (i_tg * H + i_h).to(tl.int64) * K*V 
+    h += (boh * H + i_h).to(tl.int64) * K*V 
+    dh += (boh * H + i_h).to(tl.int64) * K*V 
+    # h += (bos * H + i_h).to(tl.int64) * K*V 
+    # dh += (bos * H + i_h).to(tl.int64) * K*V 
     q += (bos_q_o * H + i_h) * K  # q uses true sequence indexing
     k += (bos * H + i_h) * K  # k uses expanded sequence indexing
     dq += (bos_q_o * H + i_h) * K  # dq uses true sequence indexing
@@ -648,7 +655,6 @@ def chunk_bwd_kernel_dqkwg(
     #     b_g_last = b_gamma * min(BT, T - i_t * BT)
     b_dq = tl.zeros([BT, BK], dtype=tl.float32)
     b_dk = tl.zeros([BT, BK], dtype=tl.float32)
-    b_ds = tl.zeros([BT, BT], dtype=tl.float32)
     b_dw = tl.zeros([BT, BK], dtype=tl.float32) if USE_DW else None
 
     if USE_G: 
@@ -663,16 +669,17 @@ def chunk_bwd_kernel_dqkwg(
         # zero out b_dk and b_dw
         b_dk = tl.zeros([BT, BK], dtype=tl.float32)
         b_dw = tl.zeros([BT, BK], dtype=tl.float32) if USE_DW else None
+        b_ds = tl.zeros([BT, BT], dtype=tl.float32)
 
         for i_v in range(tl.cdiv(V, BV)):
             # Load values for this Householder step - offset by i_nh 
-            # TODO fix H indexing (+ H * V?)
-            p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), ((i_tkw + i_nh) * BT, i_v * BV), (BT, BV), (1, 0))
-            # TODO check indexing 
-            p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
+            p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), ((i_t * num_householder + i_nh) * BT, i_v * BV), (BT, BV), (1, 0))
+            # h indexing: h is already offset to current chunk, just index by i_nh
+            p_h = tl.make_block_ptr(h + (i_t) * K * V, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1)) 
 
             p_do = tl.make_block_ptr(do, (T_true, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-            p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
+
+            p_dh = tl.make_block_ptr(dh + (i_t) * K * V, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1)) 
             # [BT, BV]
             b_v = tl.load(p_v, boundary_check=(0, 1))
             b_do = tl.load(p_do, boundary_check=(0, 1))
@@ -683,72 +690,119 @@ def chunk_bwd_kernel_dqkwg(
                 if i_nh == 0:
                     b_dg_last += (tl.sum(b_h * b_dh))
 
+            # add only once throughout range num_householder 
             if i_nh == 0: 
                 b_dq += tl.dot(b_do, b_h.to(b_do.dtype))
 
-        # Compute attention scores for this Householder step
-        # [BT, BV] @ [BV, BT] -> [BT, BT]
-
-            # BT, BT chunk 
+            # [BT, BV] @ [BV, BT] -> [BT, BT]
             b_ds += tl.dot(b_do, tl.trans(b_v))
             # Compute gradient w.r.t. k: dk += v @ dh^T
             # [BT, BV] @ [BV, BK] -> [BT, BK]
             b_dk += tl.dot(b_v, b_dh.to(b_v.dtype)) 
             if USE_DW:
-                p_dv = tl.make_block_ptr(dv, (T, V), (H*V, 1), ((i_tkw + i_nh) * BT, i_v * BV), (BT, BV), (1, 0))
+                p_dv = tl.make_block_ptr(dv, (T, V), (H*V, 1), ((i_t * num_householder + i_nh) * BT, i_v * BV), (BT, BV), (1, 0))
                 b_dv = tl.load(p_dv, boundary_check=(0, 1))
                 # Compute gradient w.r.t. w: dw += dv @ h^T
                 b_dw += tl.dot(b_dv.to(b_v.dtype), b_h.to(b_v.dtype))
 
-    
         # Store gradient for this Householder step's dw
         if USE_DW:
-            p_dw = tl.make_block_ptr(dw + H * K, (T, K), (H * K, 1), ((i_tkw + i_nh) * BT, i_k * BK), (BT, BK), (1, 0))
+            p_dw = tl.make_block_ptr(dw, (T, K), (H * K, 1), ((i_t * num_householder + i_nh) * BT, i_k * BK), (BT, BK), (1, 0))
             tl.store(p_dw, -b_dw.to(p_dw.dtype.element_ty), boundary_check=(0, 1))
 
         tl.debug_barrier()
         p_q = tl.make_block_ptr(q, (T_true, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), ((i_tkw + i_nh) * BT, i_k * BK), (BT, BK), (1, 0))
+        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), ((i_t * num_householder + i_nh) * BT, i_k * BK), (BT, BK), (1, 0))
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_k = tl.load(p_k, boundary_check=(0, 1))
 
-        p_dq = tl.make_block_ptr(dq, (T_true, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dk = tl.make_block_ptr(dk + H * K, (T, K), (H * K, 1), ((i_tkw + i_nh) * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dk = tl.make_block_ptr(dk, (T, K), (H * K, 1), ((i_t * num_householder + i_nh) * BT, i_k * BK), (BT, BK), (1, 0))
 
         # Create expanded mask like in dv_local
         o_t = i_t * BT * num_householder + tl.arange(0, BT * num_householder)
         m_t = o_t < T
-        m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
+        # m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
+        # m_A_reduced = m_A[num_householder-1::num_householder, i_nh*BT:(i_nh+1)*BT]
+
+        o_t_rows = i_t * BT * num_householder + (num_householder - 1) + tl.arange(0, BT) * num_householder
+        o_t_cols= i_t * BT * num_householder + i_nh * BT + tl.arange(0, BT) # i_T * BT + tl.arange(0, BT)
+        
+        m_t_rows = o_t_rows < T
+        m_t_cols = o_t_cols < T
+        m_A_reduced = (o_t_rows[:, None] >= o_t_cols[None, :]) & (m_t_rows[:, None] & m_t_cols[None, :])
+
         # Reduce mask to BT x BT for current Householder step
-        m_A_reduced = m_A[num_householder-1::num_householder, i_nh*BT:(i_nh+1)*BT]
         if USE_G:
             g += bos * H + i_h
             dg += bos * H + i_h
             p_g = tl.make_block_ptr(g, (T_true,), (H,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
-            b_g_last = tl.load(g + (min(i_t * BT + BT, T_true) - 1) * H)
-            b_dg_last *= exp(b_g_last)
+            if i_nh == 0: 
+                b_g_last = tl.load(g + (min(i_t * BT + BT, T_true) - 1) * H)
+                b_dg_last *= exp(b_g_last)
 
             # Apply gating to gradients
             if i_nh == 0: 
                 b_dq = b_dq * exp(b_g)[:, None] * scale
                 b_dg += tl.sum(b_dq * b_q, axis=1)
 
-            b_g_expanded = b_g.repeat_interleave(num_householder, dim=1)
-            b_g_expanded = b_g_expanded[i_nh*BT:(i_nh+1)*BT] 
+            # Create expanded g by repeating each element num_householder times
+            # and then extract the slice for current Householder step
+            # indices = tl.arange(0, BT) // num_householder
+            # b_g_expanded = b_g[indices] 
     
-            b_dk = b_dk * tl.where(m_t, exp(-b_g_expanded + b_g_last), 0)[:, None]
-            b_dg_expanded[i_nh*BT:(i_nh+1)*BT] -= tl.sum(b_k * b_dk, axis=1)
+            # b_dk = b_dk * tl.where(m_t, exp(-b_g_expanded + b_g_last), 0)[:, None]
+            # b_dg_expanded[i_nh*BT:(i_nh+1)*BT] -= tl.sum(b_k * b_dk, axis=1)
+            # b_dg_expanded[i_nh*BT + tl.arange(0, BT)] -= tl.sum(b_k * b_dk, axis=1)
+            # b_dg_last += tl.sum(b_dk * b_k)
+
+            # # Apply causal mask and gating to attention scores like in dv_local
+            # # Create gating mask for reduced BT x BT block
+            # indices = tl.arange(0, BT) // num_householder
+            # b_g_cols = b_g[indices]
+            # g_mask = (b_g[None, :] - b_g_cols[:, None])
+            # b_ds = tl.where(m_A_reduced, b_ds * exp(g_mask), 0) * scale
+            # b_ds2 = b_ds * tl.dot(b_q, tl.trans(b_k))
+            # b_dg_expanded[i_nh*BT:(i_nh+1)*BT] += tl.sum(b_ds2, axis=1)
+            # b_dg_expanded[i_nh*BT:(i_nh+1)*BT] -= tl.sum(b_ds2, axis=0)
+
+            # and then extract the slice for current Householder step
+            indices = (BT * i_nh + tl.arange(0, BT)) // num_householder
+            b_g_expanded = b_g[indices] 
+    
+            # Create mask for current Householder step (BT elements)
+            o_t_nh = i_t * BT * num_householder + i_nh * BT + tl.arange(0, BT)
+            m_t_nh = o_t_nh < T
+            
+            b_dk = b_dk * tl.where(m_t_nh, exp(-b_g_expanded + b_g_last), 0)[:, None]
+            
+            # Accumulate gradients for this Householder step
+            b_dg_nh = tl.zeros([BT], dtype=tl.float32)
+            b_dg_nh -= tl.sum(b_k * b_dk, axis=1)
+            
+            # Store in the appropriate slice of b_dg_expanded
+            for idx in range(BT):
+                b_dg_expanded[i_nh*BT + idx] += b_dg_nh[idx]
+            
             b_dg_last += tl.sum(b_dk * b_k)
 
             # Apply causal mask and gating to attention scores like in dv_local
-            g_mask = (b_g[None, :] - b_g[:, None]) 
-            g_mask = g_mask.repeat_interleave(num_householder, dim=1)
-            g_mask = g_mask[:, i_nh*BT:(i_nh+1)*BT]
+            # Create gating mask for reduced BT x BT block
+            # indices = tl.arange(0, BT) // num_householder
+            # TODO fix this part 
+            b_g_cols = b_g[indices]
+            g_mask = (b_g[None, :] - b_g_cols[:, None])
             b_ds = tl.where(m_A_reduced, b_ds * exp(g_mask), 0) * scale
             b_ds2 = b_ds * tl.dot(b_q, tl.trans(b_k))
-            b_dg_expanded[i_nh*BT:(i_nh+1)*BT] += tl.sum(b_ds2, axis=1)
-            b_dg_expanded[i_nh*BT:(i_nh+1)*BT] -= tl.sum(b_ds2, axis=0)
+
+            b_dg += tl.sum(b_ds2, axis=1)
+            
+            # Compute gradient contributions for this Householder step
+            b_dg_contrib = - tl.sum(b_ds2, axis=0)
+            
+            # Store in the appropriate slice of b_dg_expanded
+            for idx in range(BT):
+                b_dg_expanded[i_nh*BT + idx] += b_dg_contrib[idx]
 
             # Gate gradients are computed from q, k, and attention scores
 
@@ -785,6 +839,7 @@ def chunk_bwd_kernel_dqkwg(
         
         
     # Store final gradients
+    p_dq = tl.make_block_ptr(dq, (T_true, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
     if USE_G:
         # Handle boundary condition for gate gradients
@@ -814,8 +869,11 @@ def chunk_bwd_dqkwg(
     scale: float = 1.0,
     num_householder: int = 1,
 ):
-
-    B, T, H, K, V = *k.shape, v.shape[-1]
+    # q and do are original (non-expanded), k and v are expanded
+    B, T_true, H, K = q.shape
+    V = do.shape[-1]
+    T = k.shape[1]  # Expanded T from k
+    assert T == T_true * num_householder, f"k.shape[1] ({T}) must equal q.shape[1] * num_householder ({T_true * num_householder})"
     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
     chunk_indices = prepare_chunk_indices(cu_seqlens // num_householder, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T // num_householder, BT) if cu_seqlens is None else len(chunk_indices)

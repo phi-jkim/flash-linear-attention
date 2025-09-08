@@ -13,8 +13,6 @@ from fla.ops.gated_delta_product.chunk_deltaproduct_o import chunk_gated_delta_p
 from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd as gdn_recompute_w_u_fwd
 from fla.ops.utils import chunk_local_cumsum, solve_tril
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
-from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd
-from fla.ops.delta_rule.chunk import chunk_delta_rule_bwd
 
 
 def chunk_gated_delta_product_fwd(
@@ -35,10 +33,13 @@ def chunk_gated_delta_product_fwd(
         g_interleaved[:, :, 0] = g
         g_interleaved = rearrange(g_interleaved, 'b l n h -> b (l n) h').contiguous()
         g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens, output_dtype=torch.float32)
+        g_interleaved_N = chunk_local_cumsum(g_interleaved, chunk_size=64*num_householder, cu_seqlens=cu_seqlens_dp, output_dtype=torch.float32)
         g_interleaved = chunk_local_cumsum(g_interleaved, chunk_size=64, cu_seqlens=cu_seqlens_dp, output_dtype=torch.float32)
     else:
+        g_interleaved_N = None
         g_interleaved = None
         g = None
+
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
@@ -89,7 +90,7 @@ def chunk_gated_delta_product_fwd(
         cu_seqlens=cu_seqlens,
         num_householder=num_householder,
     )
-    return g, g_interleaved, o, A, final_state
+    return g, g_interleaved, g_interleaved_N, o, A, final_state
 
 
 def chunk_gated_delta_product_bwd(
@@ -98,6 +99,7 @@ def chunk_gated_delta_product_bwd(
     v: torch.Tensor,
     g: torch.Tensor,
     g_interleaved: torch.Tensor,
+    g_interleaved_N: torch.Tensor,
     beta: torch.Tensor,
     A: torch.Tensor,
     do: torch.Tensor,
@@ -114,20 +116,51 @@ def chunk_gated_delta_product_bwd(
     q_org, q = q, rearrange(q_new, 'b t n h d -> b (t n) h d')
     do_org, do = do, rearrange(do_new, 'b t n h d -> b (t n) h d')
 
-    from fla.ops.gated_delta_product.chunk_deltaproduct_h import chunk_gated_delta_product_bwd_dhu
+    from fla.ops.gated_delta_product.chunk_deltaproduct_h import (
+        chunk_gated_delta_product_bwd_dhu,
+        chunk_gated_delta_product_fwd_h
+    )
 
     cu_seqlens_dp = cu_seqlens * num_householder if cu_seqlens is not None else None
 
     # recompute w, u from WY representation to compute gradient
-    # from fla.ops.delta_rule.wy_fast import recompute_w_u_fwd as dn_recompute_w_u_fwd
     from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd 
 
-    w, u = recompute_w_u_fwd(
-        k=k, v=v, beta=beta, A=A, g=g_interleaved, cu_seqlens=cu_seqlens_dp,
+    A = chunk_scaled_dot_kkt_fwd(
+        k=k,
+        g=g_interleaved_N,
+        beta=beta,
+        cu_seqlens=cu_seqlens_dp,
+        output_dtype=torch.float32, 
+        chunk_size=64*num_householder,
+    )
+    A = solve_tril(
+        A=A,
+        cu_seqlens=cu_seqlens_dp,
+        output_dtype=k.dtype
     )
 
+    w, u = recompute_w_u_fwd(
+        k=k, v=v, beta=beta, A=A, g=g_interleaved_N, cu_seqlens=cu_seqlens_dp, 
+    )
+
+    from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+
+    # TODO replace with delta product fwd_h 
+    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+        k=k,
+        w=w,
+        u=u,
+        g=g_interleaved_N,
+        initial_state=initial_state,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens_dp,
+        chunk_size=64*num_householder,
+    )
+
+    # Recompute h and v_new using delta product forward
     # h, v_new, _ = chunk_gated_delta_product_fwd_h(
-    #     k=k,
+    #     k=k,333
     #     w=w,
     #     u=u,
     #     g=g_interleaved,
@@ -137,47 +170,18 @@ def chunk_gated_delta_product_bwd(
     #     num_householder=num_householder,
     # )
 
-    from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+    from fla.ops.common.chunk_o import chunk_bwd_dv_local
 
-    # TODO replace with delta product fwd_h 
-    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+    # Compute local gradient w.r.t v_new
+    dv_new = chunk_bwd_dv_local(
+        q=q,
         k=k,
-        w=w,
-        u=u,
-        g=g_interleaved,
-        initial_state=initial_state,
-        output_final_state=False,
-        cu_seqlens=cu_seqlens_dp,
-    )
-
-    # from fla.ops.common.chunk_o import chunk_bwd_dv_local
-
-    # # is the same for chunk gated delta product and chunk gated delta rule
-    # dv_new = chunk_bwd_dv_local(
-    #     q=q,
-    #     k=k,
-    #     g=g_interleaved,  # chunk_gated_delta_product_fwd_o uses g
-    #     do=do,
-    #     scale=scale,
-    #     cu_seqlens=cu_seqlens_dp,
-    # )
-
-    from fla.ops.gated_delta_product.chunk_deltaproduct_o import chunk_gated_delta_product_bwd_dv_local
-
-    dv_new = chunk_gated_delta_product_bwd_dv_local(
-        q=q_org,
-        k=k,
-        g=g,
-        do=do_org,
+        g=g_interleaved_N,
+        do=do,
         scale=scale,
         cu_seqlens=cu_seqlens_dp,
-        num_householder=num_householder,
+        chunk_size=64*num_householder,
     )
-
-    # du is the gradient wrt to u
-    # dh is [B, NT, H, K, V] (NT is number of chunks or groups of tokens) the gradient wrt to H[0] to H[T]
-    # need to account for gradients used for sequential computation of hidden states of H_0 to H_T (sequential)
-    # dh, dh0, du = chunk_gated_delta_product_bwd_dhu(
 
     from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu
 
@@ -185,37 +189,77 @@ def chunk_gated_delta_product_bwd(
         q=q,
         k=k,
         w=w,
-        g=g_interleaved,  # chunk_gated_delta_product_fwd_h uses g_interleaved
+        g=g_interleaved_N,  # chunk_gated_delta_product_fwd_h uses g_interleaved
         h0=initial_state,  # H_0
         dht=dht,  # gradient w.r.t to last hidden state
         do=do,  # gradient of the output
         dv=dv_new,  # gradient w.r.t. v_new
         scale=scale,
         cu_seqlens=cu_seqlens_dp,  # use cu_seqlens_dp which is expanded
+        chunk_size=64*num_householder,
         # num_householder=num_householder,
     )
 
+    # from fla.ops.gated_delta_product.chunk_deltaproduct_h import chunk_gated_delta_product_bwd_dhu
+
+    # # Use optimized delta product backward for hidden states
+    # # Note: This uses v_new from the forward pass for efficiency
+    # dh, dh0, du = chunk_gated_delta_product_bwd_dhu(
+    #     q=q,                   # Use original q (not expanded)
+    #     k=k,                       # k is already expanded (B, T*num_householder, H, K)
+    #     v=v_new,                   # v_new from forward pass (U[t] - W[t]H[t]^T)
+    #     g=g_interleaved,                       # Use original g (not interleaved)
+    #     h0=initial_state,
+    #     dht=dht,
+    #     do=do,                 # Use original do (not expanded)
+    #     dv=dv_new,                 # Gradient w.r.t. v_new
+    #     scale=scale,
+    #     cu_seqlens=cu_seqlens_dp,  # Expanded sequence lengths
+    #     num_householder=num_householder,
+    # )
+
+    # Use optimized delta product backward for output gradients
+    # from fla.ops.gated_delta_product.chunk_deltaproduct_o import chunk_bwd_dqkwg
+
+    # # This version works directly with original tensors and handles num_householder internally
+    # dq, dk_direct_gradient, dw, dg_local = chunk_bwd_dqkwg(
+    #     q=q_org,                      # Original q (not expanded)
+    #     k=k,                          # Expanded k (B, T*num_householder, H, K)
+    #     v=v,                          # Original v (expanded)
+    #     do=do_org,                    # Original do (not expanded)
+    #     h=h,                          # Hidden states from forward
+    #     dh=dh,                        # Hidden state gradients from dhu
+    #     g=g,                          # Original g (not interleaved)
+    #     g_gamma=None,                 # Not used in this version
+    #     dv=du,                      # Not needed for delta product version
+    #     w=w,                       # W handled internally
+    #     cu_seqlens=cu_seqlens_dp,     # Expanded sequence lengths
+    #     scale=scale,
+    #     num_householder=num_householder,
+    # )
+
     from fla.ops.common.chunk_o import chunk_bwd_dqkwg
 
-    # TODO implement delta product version of chunk_bwd_dqkwg
-    # dq and dw is final
-    # By multivariate chain rule, for L = f(O) and O = g(k, v_new(k))
-    # dL/dK = dL/dO * dO/dK + dL/dO * dO/dv_new * dv_new/dK
-    # dk_direct_gradient is the direct gradient computed considering v_new as a fixed quantity (by product rule)
-    # dk_direct_gradient should be fully parallelizable
-    # might be sequential as dq depends on H (might need forward pass)
+    # # TODO implement delta product version of chunk_bwd_dqkwg
+    # # dq and dw is final
+    # # By multivariate chain rule, for L = f(O) and O = g(k, v_new(k))
+    # # dL/dK = dL/dO * dO/dK + dL/dO * dO/dv_new * dv_new/dK
+    # # dk_direct_gradient is the direct gradient computed considering v_new as a fixed quantity (by product rule)
+    # # dk_direct_gradient should be fully parallelizable
+    # # might be sequential as dq depends on H (might need forward pass)
     dq, dk_direct_gradient, dw, dg_local = chunk_bwd_dqkwg(
         q=q,
         k=k,
         v=v_new,  # v_new = U[i] - W[i]H[i]^T
         w=w,
-        g=g_interleaved,  # should this be g or g_interleaved? since we don't find dk for the hidden states, is it g
+        g=g_interleaved_N,  # should this be g or g_interleaved? since we don't find dk for the hidden states, is it g
         h=h,
         dv=du,  # can be thought as gradient wrt v_new
         do=do,
         dh=dh,
         scale=scale,
         cu_seqlens=cu_seqlens_dp,  # cu_seqlens * num_householder
+        chunk_size=64*num_householder,
     )
 
     # compute gradients w.r.t. WY representation (dk, dv, dbeta, dg)
@@ -231,17 +275,25 @@ def chunk_gated_delta_product_bwd(
         k=k,
         v=v,
         beta=beta,
-        g=g_interleaved,
+        g=g_interleaved_N,
         A=A,
         dw=dw,  # Use key gradients from output as weights gradients
-        du=du,  # Use value gradients from hidden state backward
+        du=du,  # Use value gradients from hidden tate backward
         cu_seqlens=cu_seqlens_dp,
+        chunk_size=64*num_householder,
     )
 
-    # accumulate gradients
-    dk_direct_gradient.add_(dk_hidden_state_gradient)  # dL/dK = dL/dO * dO/dK + dL/dO * dO/dv_new * dv_new/dK
-    # by product rule add the two together
+    # Accumulate gradients
+    # For delta product: dk = dk_direct_gradient + dk_hidden_state_gradient
+    # dk_direct_gradient comes from chunk_bwd_dqkwg (direct path through output)
+    # dk_hidden_state_gradient comes from prepare_wy_repr_bwd (through WY representation)
+    dk = dk_direct_gradient.add_(dk_hidden_state_gradient)  # dL/dK = dL/dO * dO/dK + dL/dO * dO/dv_new * dv_new/dK
+    
+    # For delta product, dv comes from prepare_wy_repr_bwd
+    # (Delta rule would combine dv from chunk_bwd_dqkwg and prepare_wy_repr_bwd)
     dv_final = dv
+    
+    # Gate gradients: combine local gradients from output and WY representation
     dg_final = dg2
     
     # process gating gradients with local cumsum (reverse)
@@ -249,14 +301,15 @@ def chunk_gated_delta_product_bwd(
         dg_final.add_(dg_local)  # dL/dg = dL/dO * dO/dg + dL/dO * dO/dv_new * dv_new/dg = dg_local + dg2
         assert dg_final.dtype == torch.float32, "dg_final should be fp32"
         from fla.ops.utils import chunk_local_cumsum
-        dg_final = chunk_local_cumsum(dg_final, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens_dp)
+        # dg_final = chunk_local_cumsum(dg_final, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens_dp)
+        dg_final = chunk_local_cumsum(dg_final, chunk_size=64*num_householder, reverse=True, cu_seqlens=cu_seqlens_dp)
 
         # Convert interleaved gating gradients back to original format
         dg_final = rearrange(dg_final, 'b (l n) h -> b l n h', n=num_householder)[:, :, 0].contiguous()
     else:
         dg_final = None
 
-    return dq, dk_direct_gradient, dv_final, dg_final, dbeta, dh0
+    return dq, dk, dv_final, dg_final, dbeta, dh0
 
 
 class ChunkGatedDeltaProductFunction(torch.autograd.Function):
@@ -296,7 +349,7 @@ class ChunkGatedDeltaProductFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             num_householder=num_householder,
         )
-        ctx.save_for_backward(q, q_rstd, k, k_rstd, v, g, g_interleaved, beta, A, initial_state, cu_seqlens)
+        ctx.save_for_backward(q, q_rstd, k, k_rstd, v, g, g_interleaved, g_interleaved_N, beta, A, initial_state, cu_seqlens)
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx.num_householder = num_householder
@@ -310,82 +363,17 @@ class ChunkGatedDeltaProductFunction(torch.autograd.Function):
         do: torch.Tensor,
         dht: torch.Tensor
     ):
-        # q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
-        # q_new = q.new_zeros(q.shape[0], q.shape[1], ctx.num_householder, q.shape[2], q.shape[3])
-        # q_new[:, :, -1] = q
-        # do_new = do.new_zeros(do.shape[0], do.shape[1], ctx.num_householder, do.shape[2], do.shape[3])
-        # do_new[:, :, -1] = do
-        # q_org, q = q, rearrange(q_new, 'b t n h d -> b (t n) h d')
-        # do = rearrange(do_new, 'b t n h d -> b (t n) h d')
-        # # call the gated deltanet kernel for now.
-        # # TODO: optimize the backward pass like the forward pass.
-        # if g is not None:
-        #     dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
-        #         q=q,
-        #         k=k,
-        #         v=v,
-        #         g=g,
-        #         beta=beta,
-        #         A=A,
-        #         scale=ctx.scale,
-        #         initial_state=initial_state,
-        #         do=do,
-        #         dht=dht,
-        #         cu_seqlens=cu_seqlens * ctx.num_householder if cu_seqlens is not None else None,
-        #     )
-        #     dg = rearrange(dg, 'b (l n) h  -> b l n h ', n=ctx.num_householder)[:, :, 0].contiguous().to(g)
-        # else:
-        #     dq, dk, dv, db, dh0 = chunk_delta_rule_bwd(
-        #         q=q,
-        #         k=k,
-        #         v=v,
-        #         beta=beta,
-        #         A=A,
-        #         scale=ctx.scale,
-        #         initial_state=initial_state,
-        #         do=do,
-        #         dht=dht,
-        #         cu_seqlens=cu_seqlens * ctx.num_householder if cu_seqlens is not None else None,
-        #     )
-        #     dg = None
-        # dq = rearrange(dq, 'b (l n) h d -> b l n h d', n=ctx.num_householder)[:, :, -1].contiguous()
-        # if ctx.use_qk_l2norm_in_kernel:
-        #     dq = l2norm_bwd(q_org, q_rstd, dq)
-        #     dk = l2norm_bwd(k, k_rstd, dk)
-        # return dq.to(q), dk.to(k), dv.to(v), dg, db.to(beta), None, None, dh0, None, None, None
-
-        # New backward impelmentation
-        q, q_rstd, k, k_rstd, v, g, g_interleaved, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
+        q, q_rstd, k, k_rstd, v, g, g_interleaved, g_interleaved_N, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
 
         # recompute forward intermediate values
-        from fla.ops.gated_delta_product.chunk_deltaproduct_h import chunk_gated_delta_product_fwd_h
-        from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd 
-
-        cu_seqlens_dp = cu_seqlens * ctx.num_householder if cu_seqlens is not None else None
-
-        # recompute h and v_new from hidden state computation (why can't we store this originally in ctx)
-        # v_new = (U[t] - W[t]H[t]^T)
-
-        # need to get g and g_interleaved
-        # if g is not None:
-        #     g_interleaved = g.new_zeros(g.shape[0], g.shape[1], ctx.num_householder, g.shape[2], dtype=torch.float32)
-        #     g_interleaved[:, :, 0] = g
-        #     g_interleaved = rearrange(g_interleaved, 'b l n h -> b (l n) h').contiguous()
-        #     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens, output_dtype=torch.float32)
-        #     g_interleaved = chunk_local_cumsum(
-        #         g_interleaved, chunk_size=64, cu_seqlens=cu_seqlens_dp, output_dtype=torch.float32
-        #     )
-        # else:
-        #     g_interleaved = None
-        #     g = None
-
-        # call our optimized backward pass
+        # Call optimized delta product backward pass
         dq, dk, dv, dg, db, dh0 = chunk_gated_delta_product_bwd(
             q=q,
             k=k,
             v=v,
             g=g,  # use g
             g_interleaved=g_interleaved,  # use computed g_interleaved
+            g_interleaved_N=g_interleaved_N,
             beta=beta,
             A=A,
             do=do,

@@ -492,7 +492,7 @@ def chunk_gated_delta_rule_bwd_dhu(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *q.shape, do.shape[-1]
     # N: the actual number of sequences in the batch with either equal or variable lengths
-    BT = 64
+    BT = chunk_size
     assert K <= 256, "current kernel does not support head dimension being larger than 256."
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
