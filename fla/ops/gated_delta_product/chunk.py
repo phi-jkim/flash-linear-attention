@@ -337,7 +337,7 @@ class ChunkGatedDeltaProductFunction(torch.autograd.Function):
         else:
             q_rstd, k_rstd = None, None
 
-        g, g_interleaved, o, A, final_state = chunk_gated_delta_product_fwd(
+        g, g_interleaved, g_interleaved_N, o, A, final_state = chunk_gated_delta_product_fwd(
             q=q,
             k=k,
             v=v,
