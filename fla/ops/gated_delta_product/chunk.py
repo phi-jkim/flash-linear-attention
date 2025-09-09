@@ -34,7 +34,7 @@ def chunk_gated_delta_product_fwd(
         g_interleaved = rearrange(g_interleaved, 'b l n h -> b (l n) h').contiguous()
         g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens, output_dtype=torch.float32)
         # g_interleaved_N = chunk_local_cumsum(g_interleaved, chunk_size=64*num_householder, cu_seqlens=cu_seqlens_dp, output_dtype=torch.float32)
-        g_interleaved_N = chunk_local_cumsum(g_interleaved, chunk_size=16, cu_seqlens=cu_seqlens_dp, output_dtype=torch.float32)
+        g_interleaved_N = chunk_local_cumsum(g_interleaved, chunk_size=128, cu_seqlens=cu_seqlens_dp, output_dtype=torch.float32)
         g_interleaved = chunk_local_cumsum(g_interleaved, chunk_size=64, cu_seqlens=cu_seqlens_dp, output_dtype=torch.float32)
     else:
         g_interleaved_N = None
@@ -134,7 +134,7 @@ def chunk_gated_delta_product_bwd(
         cu_seqlens=cu_seqlens_dp,
         output_dtype=torch.float32, 
         # chunk_size=64*num_householder,
-        chunk_size=16,
+        chunk_size=128,
     )
 
     A = solve_tril(
@@ -159,7 +159,7 @@ def chunk_gated_delta_product_bwd(
         output_final_state=False,
         cu_seqlens=cu_seqlens_dp,
         # chunk_size=64*num_householder,
-        chunk_size=16,
+        chunk_size=128,
     )
 
     # Recompute h and v_new using delta product forward
@@ -185,7 +185,7 @@ def chunk_gated_delta_product_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens_dp,
         # chunk_size=64*num_householder,
-        chunk_size=16,
+        chunk_size=128,
     )
 
     from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu
@@ -203,7 +203,7 @@ def chunk_gated_delta_product_bwd(
         cu_seqlens=cu_seqlens_dp,  # use cu_seqlens_dp which is expanded
         # chunk_size=64*num_householder,
         # num_householder=num_householder,
-        chunk_size=16,
+        chunk_size=128,
     )
 
     # from fla.ops.gated_delta_product.chunk_deltaproduct_h import chunk_gated_delta_product_bwd_dhu
@@ -266,7 +266,7 @@ def chunk_gated_delta_product_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens_dp,  # cu_seqlens * num_householder
         # chunk_size=64*num_householder,
-        chunk_size=16,
+        chunk_size=128,
     )
 
     # compute gradients w.r.t. WY representation (dk, dv, dbeta, dg)
@@ -288,7 +288,7 @@ def chunk_gated_delta_product_bwd(
         du=du,  # Use value gradients from hidden tate backward
         cu_seqlens=cu_seqlens_dp,
         # chunk_size=64*num_householder,
-        chunk_size=16,
+        chunk_size=128,
     )
 
     # Accumulate gradients
@@ -309,7 +309,7 @@ def chunk_gated_delta_product_bwd(
         dg_final.add_(dg_local)  # dL/dg = dL/dO * dO/dg + dL/dO * dO/dv_new * dv_new/dg = dg_local + dg2
         assert dg_final.dtype == torch.float32, "dg_final should be fp32"
         from fla.ops.utils import chunk_local_cumsum
-        dg_final = chunk_local_cumsum(dg_final, chunk_size=16, reverse=True, cu_seqlens=cu_seqlens_dp)
+        dg_final = chunk_local_cumsum(dg_final, chunk_size=128, reverse=True, cu_seqlens=cu_seqlens_dp)
         # dg_final = chunk_local_cumsum(dg_final, chunk_size=64*num_householder, reverse=True, cu_seqlens=cu_seqlens_dp)
 
         # Convert interleaved gating gradients back to original format
