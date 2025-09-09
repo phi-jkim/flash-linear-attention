@@ -707,9 +707,6 @@ def merge_16x16_to_64x64_inverse_kernel(
 #         desc_o.store([i_t * BT + 112, 80], b_Ai_86.to(desc_o.dtype, fp_downcast_rounding="rtne"))
 #         desc_o.store([i_t * BT + 112, 96], b_Ai_87.to(desc_o.dtype, fp_downcast_rounding="rtne"))
 
-import triton
-import triton.language as tl
-
 @triton.heuristics({
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
@@ -719,28 +716,28 @@ import triton.language as tl
         for nw in (2, 4, 8)
         for ns in (2, 3, 4, 5)
     ],
-    key=["H", "BT", "IS_VARLEN", "NB"],   # NB added so tuning respects block size
+    key=["H", "BT", "IS_VARLEN", "NB", "BLK"],   # include NB & BLK in key
 )
 @triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_nxn_inverse_kernel(
-    A,              # [T, BT] per-head plane, row stride = H*BT, col stride = 1
-    Ai,             # [T, BT] output inverse, same layout
-    cu_seqlens,     # [B+1] or None
-    chunk_indices,  # [num_chunks, 2] (i_n, i_t) when varlen else None
-    T,              # seq len per batch item if fixed
+    A,
+    Ai,
+    cu_seqlens,
+    chunk_indices,
+    T,
     H: tl.constexpr,
     BT: tl.constexpr,
-    NB: tl.constexpr,            # number of 16x16 sub-blocks per side; N = 16*NB
-    USE_TMA: tl.constexpr,       # kept for API symmetry; unused (manual path)
+    NB: tl.constexpr,            # number of sub-blocks per side
+    BLK: tl.constexpr,           # <-- NEW (must be 16)
+    USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    DOT_PRECISION: tl.constexpr, # e.g. "high" or "tf32"
+    DOT_PRECISION: tl.constexpr,
 ):
-    # -------- program coordinates --------
+    # program ids
     i_t_pid, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
 
-    # -------- resolve BOS/EOS, T --------
-    # Keep a distinct i_t for address math (avoid shadowing pid)
+    # resolve BOS/EOS, T
     if IS_VARLEN:
         i_n  = tl.load(chunk_indices + i_t_pid * 2).to(tl.int32)
         i_t  = tl.load(chunk_indices + i_t_pid * 2 + 1).to(tl.int32)
@@ -752,97 +749,62 @@ def merge_16x16_to_nxn_inverse_kernel(
         bos  = i_b * T
         eos  = bos + T
 
-    # base plane advance for this head
+    # base plane advance
     A  += (bos * H + i_h) * BT
     Ai += (bos * H + i_h) * BT
 
-    # -------- constants / masks --------
-    BLK = 16
-    # Host should guard: 16*NB <= BT
-    N   = NB * BLK
-    o16 = tl.arange(0, BLK)    # [0..15]
-
-    # masks inside a 16x16 tile
-    m_strict_lower = o16[:, None] >  o16[None, :]
+    # compile-time shapes derived from BLK
+    # N = NB * BLK  # (optional; not used directly)
+    o16 = tl.arange(0, BLK)              # requires BLK constexpr
+    m_strict_lower = o16[:, None] > o16[None, :]
     m_eye          = o16[:, None] == o16[None, :]
 
-    # ===== 1) Invert all diagonal 16x16 blocks L_ii =====
+    # ===== 1) invert diagonal BLK×BLK blocks =====
     row_base = i_t * BT
-
     for b in range(NB):
         r0 = row_base + b * BLK
         c0 = b * BLK
 
-        # L_ii = I + A_ii, but A stores just the strictly-lower part; identity added later
-        p_Lbb = tl.make_block_ptr(A,  (T, BT), (H * BT, 1), (r0, c0), (BLK, BLK), (1, 0))
+        p_Lbb = tl.make_block_ptr(A,  (T, BT), (H*BT, 1), (r0, c0), (BLK, BLK), (1, 0))
         Lbb   = tl.load(p_Lbb, boundary_check=(0, 1)).to(tl.float32)
 
-        # Start from - strictly-lower(L_ii) = -A_ii
         Inv_bb = -tl.where(m_strict_lower, Lbb, 0.0)
-
-        # Complete rows i_local=2..15 via finite Neumann/forward-sub
         for i_local in range(2, BLK):
             row_idx = r0 + i_local
             col_vec = c0 + o16
-
-            # Fetch the strict-lower row of A_ii (safe near tail)
             row_vals = tl.load(
                 A + row_idx * (H * BT) + col_vec,
                 mask=(row_idx < T) & (col_vec < BT),
                 other=0.0,
             ).to(tl.float32)
-
-            # b_row := -A[i,:] + (-A[i,:]) @ Inv_bb   (only j<i contributes)
             b_row = -row_vals
-            # (1,BLK) = (1,BLK) @ (BLK,BLK)
             b_row = b_row + tl.dot(b_row[None, :], Inv_bb, input_precision=DOT_PRECISION)[0, :]
-
-            # Inject into the i_local-th row of Inv_bb
             Inv_bb = tl.where((o16 == i_local)[:, None], b_row, Inv_bb)
 
-        # Add identity to finish (I + A_ii)^{-1}
         Inv_bb += m_eye
+        p_Invbb = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (r0, c0), (BLK, BLK), (1, 0))
+        tl.store(p_Invbb, Inv_bb.to(p_Invbb.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
 
-        # Store back
-        p_Invbb = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0, c0), (BLK, BLK), (1, 0))
-        tl.store(
-            p_Invbb,
-            Inv_bb.to(p_Invbb.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-
-    # ===== 2) Off-diagonals: Ai_{ij} for i>j =====
+    # ===== off-diagonals =====
     for i_blk in range(1, NB):
         r0_i = row_base + i_blk * BLK
-
-        # Ai_ii already written
-        p_Ai_ii = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_i, i_blk * BLK), (BLK, BLK), (1, 0))
+        p_Ai_ii = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (r0_i, i_blk * BLK), (BLK, BLK), (1, 0))
         Ai_ii   = tl.load(p_Ai_ii, boundary_check=(0, 1)).to(tl.float32)
 
         for j_blk in range(0, i_blk):
             c0_j = j_blk * BLK
-
-            # S = sum_{k=j}^{i-1} L_{ik} * Ai_{kj}
-            S = tl.zeros((BLK, BLK), dtype=tl.float32)
+            S = tl.zeros((BLK, BLK), dtype=tl.float32)      # requires BLK constexpr
             for k_blk in range(j_blk, i_blk):
-                p_L_ik = tl.make_block_ptr(A,  (T, BT), (H * BT, 1), (r0_i, k_blk * BLK), (BLK, BLK), (1, 0))
+                p_L_ik = tl.make_block_ptr(A,  (T, BT), (H*BT, 1), (r0_i, k_blk * BLK), (BLK, BLK), (1, 0))
                 L_ik   = tl.load(p_L_ik, boundary_check=(0, 1)).to(tl.float32)
-
                 r0_k   = row_base + k_blk * BLK
-                p_Ai_kj = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_k, c0_j), (BLK, BLK), (1, 0))
+                p_Ai_kj = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (r0_k, c0_j), (BLK, BLK), (1, 0))
                 Ai_kj   = tl.load(p_Ai_kj, boundary_check=(0, 1)).to(tl.float32)
-
                 S += tl.dot(L_ik, Ai_kj, input_precision=DOT_PRECISION)
 
-            # Ai_{ij} = - Ai_{ii} * S
             Ai_ij = -tl.dot(Ai_ii, S, input_precision=DOT_PRECISION)
-
-            p_Ai_ij = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_i, c0_j), (BLK, BLK), (1, 0))
-            tl.store(
-                p_Ai_ij,
-                Ai_ij.to(p_Ai_ij.dtype.element_ty, fp_downcast_rounding="rtne"),
-                boundary_check=(0, 1),
-            )
+            p_Ai_ij = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (r0_i, c0_j), (BLK, BLK), (1, 0))
+            tl.store(p_Ai_ij, Ai_ij.to(p_Ai_ij.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
 
 
 # @triton.heuristics({
