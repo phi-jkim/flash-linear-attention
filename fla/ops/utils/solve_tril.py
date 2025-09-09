@@ -330,412 +330,670 @@ def merge_16x16_to_64x64_inverse_kernel(
         desc_o.store([i_t * BT + 48, 32], b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne"))
 
 
+# @triton.heuristics({
+#     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+# })
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+#         for num_warps in [4, 8]
+#         for num_stages in [2, 3, 4]
+#     ],
+#     key=['H', 'BT', 'IS_VARLEN'],
+# )
+# @triton.jit(do_not_specialize=['T'])
+# def merge_16x16_to_128x128_inverse_kernel(
+#     A,
+#     Ai,
+#     cu_seqlens,
+#     chunk_indices,
+#     T,
+#     H: tl.constexpr,
+#     BT: tl.constexpr,
+#     USE_TMA: tl.constexpr,
+#     IS_VARLEN: tl.constexpr,
+#     DOT_PRECISION: tl.constexpr
+# ):
+#     i_t, i_bh = tl.program_id(0), tl.program_id(1)
+#     i_b, i_h = i_bh // H, i_bh % H
+#     if IS_VARLEN:
+#         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+#         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+#         T = eos - bos
+#     else:
+#         bos, eos = i_b * T, i_b * T + T
+
+#     o_i = tl.arange(0, 16)
+#     m_A = o_i[:, None] > o_i[None, :]
+#     m_I = o_i[:, None] == o_i[None, :]
+#     A += (bos * H + i_h) * BT
+#     Ai += (bos * H + i_h) * BT
+
+#     if not USE_TMA:
+#         # Load and process all 8 diagonal blocks
+#         p_A_11 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT, 0), (16, 16), (1, 0))
+#         p_A_22 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0))
+#         p_A_33 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 32, 32), (16, 16), (1, 0))
+#         p_A_44 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 48, 48), (16, 16), (1, 0))
+#         p_A_55 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 64, 64), (16, 16), (1, 0))
+#         p_A_66 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 80, 80), (16, 16), (1, 0))
+#         p_A_77 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 96, 96), (16, 16), (1, 0))
+#         p_A_88 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 112, 112), (16, 16), (1, 0))
+        
+#         b_Ai_11 = tl.load(p_A_11, boundary_check=(0, 1)).to(tl.float32)
+#         b_Ai_22 = tl.load(p_A_22, boundary_check=(0, 1)).to(tl.float32)
+#         b_Ai_33 = tl.load(p_A_33, boundary_check=(0, 1)).to(tl.float32)
+#         b_Ai_44 = tl.load(p_A_44, boundary_check=(0, 1)).to(tl.float32)
+#         b_Ai_55 = tl.load(p_A_55, boundary_check=(0, 1)).to(tl.float32)
+#         b_Ai_66 = tl.load(p_A_66, boundary_check=(0, 1)).to(tl.float32)
+#         b_Ai_77 = tl.load(p_A_77, boundary_check=(0, 1)).to(tl.float32)
+#         b_Ai_88 = tl.load(p_A_88, boundary_check=(0, 1)).to(tl.float32)
+#     else:
+#         desc = make_tensor_descriptor(A, [T, BT], [H*BT, 1], [16, 16])
+#         desc_o = make_tensor_descriptor(Ai, [T, BT], [H*BT, 1], [16, 16])
+#         b_Ai_11 = desc.load([i_t * BT + 0, 0]).to(tl.float32)
+#         b_Ai_22 = desc.load([i_t * BT + 16, 16]).to(tl.float32)
+#         b_Ai_33 = desc.load([i_t * BT + 32, 32]).to(tl.float32)
+#         b_Ai_44 = desc.load([i_t * BT + 48, 48]).to(tl.float32)
+#         b_Ai_55 = desc.load([i_t * BT + 64, 64]).to(tl.float32)
+#         b_Ai_66 = desc.load([i_t * BT + 80, 80]).to(tl.float32)
+#         b_Ai_77 = desc.load([i_t * BT + 96, 96]).to(tl.float32)
+#         b_Ai_88 = desc.load([i_t * BT + 112, 112]).to(tl.float32)
+
+#     # Process diagonal blocks
+#     b_Ai_11 = -tl.where(m_A, b_Ai_11, 0)
+#     b_Ai_22 = -tl.where(m_A, b_Ai_22, 0)
+#     b_Ai_33 = -tl.where(m_A, b_Ai_33, 0)
+#     b_Ai_44 = -tl.where(m_A, b_Ai_44, 0)
+#     b_Ai_55 = -tl.where(m_A, b_Ai_55, 0)
+#     b_Ai_66 = -tl.where(m_A, b_Ai_66, 0)
+#     b_Ai_77 = -tl.where(m_A, b_Ai_77, 0)
+#     b_Ai_88 = -tl.where(m_A, b_Ai_88, 0)
+
+#     for i in range(2, min(16, T - i_t * BT)):
+#         b_a_11 = -tl.load(A + (i_t * BT + i) * H*BT + o_i)
+#         b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
+#         b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
+#     for i in range(16 + 2, min(32, T - i_t * BT)):
+#         b_a_22 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 16)
+#         b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
+#         b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
+#     for i in range(32 + 2, min(48, T - i_t * BT)):
+#         b_a_33 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 32)
+#         b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
+#         b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
+#     for i in range(48 + 2, min(64, T - i_t * BT)):
+#         b_a_44 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 48)
+#         b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
+#         b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
+#     for i in range(64 + 2, min(80, T - i_t * BT)):
+#         b_a_55 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 64)
+#         b_a_55 += tl.sum(b_a_55[:, None] * b_Ai_55, 0)
+#         b_Ai_55 = tl.where((o_i == i - 64)[:, None], b_a_55, b_Ai_55)
+#     for i in range(80 + 2, min(96, T - i_t * BT)):
+#         b_a_66 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 80)
+#         b_a_66 += tl.sum(b_a_66[:, None] * b_Ai_66, 0)
+#         b_Ai_66 = tl.where((o_i == i - 80)[:, None], b_a_66, b_Ai_66)
+#     for i in range(96 + 2, min(112, T - i_t * BT)):
+#         b_a_77 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 96)
+#         b_a_77 += tl.sum(b_a_77[:, None] * b_Ai_77, 0)
+#         b_Ai_77 = tl.where((o_i == i - 96)[:, None], b_a_77, b_Ai_77)
+#     for i in range(112 + 2, min(128, T - i_t * BT)):
+#         b_a_88 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 112)
+#         b_a_88 += tl.sum(b_a_88[:, None] * b_Ai_88, 0)
+#         b_Ai_88 = tl.where((o_i == i - 112)[:, None], b_a_88, b_Ai_88)
+
+#     b_Ai_11 += m_I
+#     b_Ai_22 += m_I
+#     b_Ai_33 += m_I
+#     b_Ai_44 += m_I
+#     b_Ai_55 += m_I
+#     b_Ai_66 += m_I
+#     b_Ai_77 += m_I
+#     b_Ai_88 += m_I
+
+#     # Load off-diagonal blocks
+#     if not USE_TMA:
+#         # Row 2
+#         p_A_21 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0))
+#         b_A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
+#         # Row 3
+#         p_A_31 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 32, 0), (16, 16), (1, 0))
+#         p_A_32 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 32, 16), (16, 16), (1, 0))
+#         b_A_31 = tl.load(p_A_31, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_32 = tl.load(p_A_32, boundary_check=(0, 1)).to(tl.float32)
+#         # Row 4
+#         p_A_41 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0))
+#         p_A_42 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0))
+#         p_A_43 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0))
+#         b_A_41 = tl.load(p_A_41, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_42 = tl.load(p_A_42, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_43 = tl.load(p_A_43, boundary_check=(0, 1)).to(tl.float32)
+#         # Row 5
+#         p_A_51 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 64, 0), (16, 16), (1, 0))
+#         p_A_52 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 64, 16), (16, 16), (1, 0))
+#         p_A_53 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 64, 32), (16, 16), (1, 0))
+#         p_A_54 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 64, 48), (16, 16), (1, 0))
+#         b_A_51 = tl.load(p_A_51, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_52 = tl.load(p_A_52, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_53 = tl.load(p_A_53, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_54 = tl.load(p_A_54, boundary_check=(0, 1)).to(tl.float32)
+#         # Row 6
+#         p_A_61 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 80, 0), (16, 16), (1, 0))
+#         p_A_62 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 80, 16), (16, 16), (1, 0))
+#         p_A_63 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 80, 32), (16, 16), (1, 0))
+#         p_A_64 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 80, 48), (16, 16), (1, 0))
+#         p_A_65 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 80, 64), (16, 16), (1, 0))
+#         b_A_61 = tl.load(p_A_61, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_62 = tl.load(p_A_62, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_63 = tl.load(p_A_63, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_64 = tl.load(p_A_64, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_65 = tl.load(p_A_65, boundary_check=(0, 1)).to(tl.float32)
+#         # Row 7
+#         p_A_71 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 96, 0), (16, 16), (1, 0))
+#         p_A_72 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 96, 16), (16, 16), (1, 0))
+#         p_A_73 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 96, 32), (16, 16), (1, 0))
+#         p_A_74 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 96, 48), (16, 16), (1, 0))
+#         p_A_75 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 96, 64), (16, 16), (1, 0))
+#         p_A_76 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 96, 80), (16, 16), (1, 0))
+#         b_A_71 = tl.load(p_A_71, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_72 = tl.load(p_A_72, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_73 = tl.load(p_A_73, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_74 = tl.load(p_A_74, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_75 = tl.load(p_A_75, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_76 = tl.load(p_A_76, boundary_check=(0, 1)).to(tl.float32)
+#         # Row 8
+#         p_A_81 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 112, 0), (16, 16), (1, 0))
+#         p_A_82 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 112, 16), (16, 16), (1, 0))
+#         p_A_83 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 112, 32), (16, 16), (1, 0))
+#         p_A_84 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 112, 48), (16, 16), (1, 0))
+#         p_A_85 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 112, 64), (16, 16), (1, 0))
+#         p_A_86 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 112, 80), (16, 16), (1, 0))
+#         p_A_87 = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + 112, 96), (16, 16), (1, 0))
+#         b_A_81 = tl.load(p_A_81, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_82 = tl.load(p_A_82, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_83 = tl.load(p_A_83, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_84 = tl.load(p_A_84, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_85 = tl.load(p_A_85, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_86 = tl.load(p_A_86, boundary_check=(0, 1)).to(tl.float32)
+#         b_A_87 = tl.load(p_A_87, boundary_check=(0, 1)).to(tl.float32)
+#     else:
+#         # Row 2
+#         b_A_21 = desc.load([i_t * BT + 16, 0]).to(tl.float32)
+#         # Row 3
+#         b_A_31 = desc.load([i_t * BT + 32, 0]).to(tl.float32)
+#         b_A_32 = desc.load([i_t * BT + 32, 16]).to(tl.float32)
+#         # Row 4
+#         b_A_41 = desc.load([i_t * BT + 48, 0]).to(tl.float32)
+#         b_A_42 = desc.load([i_t * BT + 48, 16]).to(tl.float32)
+#         b_A_43 = desc.load([i_t * BT + 48, 32]).to(tl.float32)
+#         # Row 5
+#         b_A_51 = desc.load([i_t * BT + 64, 0]).to(tl.float32)
+#         b_A_52 = desc.load([i_t * BT + 64, 16]).to(tl.float32)
+#         b_A_53 = desc.load([i_t * BT + 64, 32]).to(tl.float32)
+#         b_A_54 = desc.load([i_t * BT + 64, 48]).to(tl.float32)
+#         # Row 6
+#         b_A_61 = desc.load([i_t * BT + 80, 0]).to(tl.float32)
+#         b_A_62 = desc.load([i_t * BT + 80, 16]).to(tl.float32)
+#         b_A_63 = desc.load([i_t * BT + 80, 32]).to(tl.float32)
+#         b_A_64 = desc.load([i_t * BT + 80, 48]).to(tl.float32)
+#         b_A_65 = desc.load([i_t * BT + 80, 64]).to(tl.float32)
+#         # Row 7
+#         b_A_71 = desc.load([i_t * BT + 96, 0]).to(tl.float32)
+#         b_A_72 = desc.load([i_t * BT + 96, 16]).to(tl.float32)
+#         b_A_73 = desc.load([i_t * BT + 96, 32]).to(tl.float32)
+#         b_A_74 = desc.load([i_t * BT + 96, 48]).to(tl.float32)
+#         b_A_75 = desc.load([i_t * BT + 96, 64]).to(tl.float32)
+#         b_A_76 = desc.load([i_t * BT + 96, 80]).to(tl.float32)
+#         # Row 8
+#         b_A_81 = desc.load([i_t * BT + 112, 0]).to(tl.float32)
+#         b_A_82 = desc.load([i_t * BT + 112, 16]).to(tl.float32)
+#         b_A_83 = desc.load([i_t * BT + 112, 32]).to(tl.float32)
+#         b_A_84 = desc.load([i_t * BT + 112, 48]).to(tl.float32)
+#         b_A_85 = desc.load([i_t * BT + 112, 64]).to(tl.float32)
+#         b_A_86 = desc.load([i_t * BT + 112, 80]).to(tl.float32)
+#         b_A_87 = desc.load([i_t * BT + 112, 96]).to(tl.float32)
+
+#     # Compute off-diagonal blocks using block triangular inverse formula
+#     # Row 2
+#     b_Ai_21 = -tl.dot(tl.dot(b_Ai_22, b_A_21, input_precision=DOT_PRECISION), b_Ai_11, input_precision=DOT_PRECISION)
+#     # Row 3
+#     b_Ai_32 = -tl.dot(tl.dot(b_Ai_33, b_A_32, input_precision=DOT_PRECISION), b_Ai_22, input_precision=DOT_PRECISION)
+#     b_Ai_31 = -tl.dot(b_Ai_33, tl.dot(b_A_31, b_Ai_11, input_precision=DOT_PRECISION) + tl.dot(b_A_32, b_Ai_21, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     # Row 4
+#     b_Ai_43 = -tl.dot(tl.dot(b_Ai_44, b_A_43, input_precision=DOT_PRECISION), b_Ai_33, input_precision=DOT_PRECISION)
+#     b_Ai_42 = -tl.dot(b_Ai_44, tl.dot(b_A_42, b_Ai_22, input_precision=DOT_PRECISION) + tl.dot(b_A_43, b_Ai_32, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_41 = -tl.dot(b_Ai_44, tl.dot(b_A_41, b_Ai_11, input_precision=DOT_PRECISION) + tl.dot(b_A_42, b_Ai_21, input_precision=DOT_PRECISION) + tl.dot(b_A_43, b_Ai_31, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     # Row 5
+#     b_Ai_54 = -tl.dot(tl.dot(b_Ai_55, b_A_54, input_precision=DOT_PRECISION), b_Ai_44, input_precision=DOT_PRECISION)
+#     b_Ai_53 = -tl.dot(b_Ai_55, tl.dot(b_A_53, b_Ai_33, input_precision=DOT_PRECISION) + tl.dot(b_A_54, b_Ai_43, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_52 = -tl.dot(b_Ai_55, tl.dot(b_A_52, b_Ai_22, input_precision=DOT_PRECISION) + tl.dot(b_A_53, b_Ai_32, input_precision=DOT_PRECISION) + tl.dot(b_A_54, b_Ai_42, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_51 = -tl.dot(b_Ai_55, tl.dot(b_A_51, b_Ai_11, input_precision=DOT_PRECISION) + tl.dot(b_A_52, b_Ai_21, input_precision=DOT_PRECISION) + tl.dot(b_A_53, b_Ai_31, input_precision=DOT_PRECISION) + tl.dot(b_A_54, b_Ai_41, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     # Row 6
+#     b_Ai_65 = -tl.dot(tl.dot(b_Ai_66, b_A_65, input_precision=DOT_PRECISION), b_Ai_55, input_precision=DOT_PRECISION)
+#     b_Ai_64 = -tl.dot(b_Ai_66, tl.dot(b_A_64, b_Ai_44, input_precision=DOT_PRECISION) + tl.dot(b_A_65, b_Ai_54, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_63 = -tl.dot(b_Ai_66, tl.dot(b_A_63, b_Ai_33, input_precision=DOT_PRECISION) + tl.dot(b_A_64, b_Ai_43, input_precision=DOT_PRECISION) + tl.dot(b_A_65, b_Ai_53, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_62 = -tl.dot(b_Ai_66, tl.dot(b_A_62, b_Ai_22, input_precision=DOT_PRECISION) + tl.dot(b_A_63, b_Ai_32, input_precision=DOT_PRECISION) + tl.dot(b_A_64, b_Ai_42, input_precision=DOT_PRECISION) + tl.dot(b_A_65, b_Ai_52, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_61 = -tl.dot(b_Ai_66, tl.dot(b_A_61, b_Ai_11, input_precision=DOT_PRECISION) + tl.dot(b_A_62, b_Ai_21, input_precision=DOT_PRECISION) + tl.dot(b_A_63, b_Ai_31, input_precision=DOT_PRECISION) + tl.dot(b_A_64, b_Ai_41, input_precision=DOT_PRECISION) + tl.dot(b_A_65, b_Ai_51, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     # Row 7
+#     b_Ai_76 = -tl.dot(tl.dot(b_Ai_77, b_A_76, input_precision=DOT_PRECISION), b_Ai_66, input_precision=DOT_PRECISION)
+#     b_Ai_75 = -tl.dot(b_Ai_77, tl.dot(b_A_75, b_Ai_55, input_precision=DOT_PRECISION) + tl.dot(b_A_76, b_Ai_65, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_74 = -tl.dot(b_Ai_77, tl.dot(b_A_74, b_Ai_44, input_precision=DOT_PRECISION) + tl.dot(b_A_75, b_Ai_54, input_precision=DOT_PRECISION) + tl.dot(b_A_76, b_Ai_64, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_73 = -tl.dot(b_Ai_77, tl.dot(b_A_73, b_Ai_33, input_precision=DOT_PRECISION) + tl.dot(b_A_74, b_Ai_43, input_precision=DOT_PRECISION) + tl.dot(b_A_75, b_Ai_53, input_precision=DOT_PRECISION) + tl.dot(b_A_76, b_Ai_63, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_72 = -tl.dot(b_Ai_77, tl.dot(b_A_72, b_Ai_22, input_precision=DOT_PRECISION) + tl.dot(b_A_73, b_Ai_32, input_precision=DOT_PRECISION) + tl.dot(b_A_74, b_Ai_42, input_precision=DOT_PRECISION) + tl.dot(b_A_75, b_Ai_52, input_precision=DOT_PRECISION) + tl.dot(b_A_76, b_Ai_62, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_71 = -tl.dot(b_Ai_77, tl.dot(b_A_71, b_Ai_11, input_precision=DOT_PRECISION) + tl.dot(b_A_72, b_Ai_21, input_precision=DOT_PRECISION) + tl.dot(b_A_73, b_Ai_31, input_precision=DOT_PRECISION) + tl.dot(b_A_74, b_Ai_41, input_precision=DOT_PRECISION) + tl.dot(b_A_75, b_Ai_51, input_precision=DOT_PRECISION) + tl.dot(b_A_76, b_Ai_61, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     # Row 8
+#     b_Ai_87 = -tl.dot(tl.dot(b_Ai_88, b_A_87, input_precision=DOT_PRECISION), b_Ai_77, input_precision=DOT_PRECISION)
+#     b_Ai_86 = -tl.dot(b_Ai_88, tl.dot(b_A_86, b_Ai_66, input_precision=DOT_PRECISION) + tl.dot(b_A_87, b_Ai_76, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_85 = -tl.dot(b_Ai_88, tl.dot(b_A_85, b_Ai_55, input_precision=DOT_PRECISION) + tl.dot(b_A_86, b_Ai_65, input_precision=DOT_PRECISION) + tl.dot(b_A_87, b_Ai_75, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_84 = -tl.dot(b_Ai_88, tl.dot(b_A_84, b_Ai_44, input_precision=DOT_PRECISION) + tl.dot(b_A_85, b_Ai_54, input_precision=DOT_PRECISION) + tl.dot(b_A_86, b_Ai_64, input_precision=DOT_PRECISION) + tl.dot(b_A_87, b_Ai_74, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_83 = -tl.dot(b_Ai_88, tl.dot(b_A_83, b_Ai_33, input_precision=DOT_PRECISION) + tl.dot(b_A_84, b_Ai_43, input_precision=DOT_PRECISION) + tl.dot(b_A_85, b_Ai_53, input_precision=DOT_PRECISION) + tl.dot(b_A_86, b_Ai_63, input_precision=DOT_PRECISION) + tl.dot(b_A_87, b_Ai_73, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_82 = -tl.dot(b_Ai_88, tl.dot(b_A_82, b_Ai_22, input_precision=DOT_PRECISION) + tl.dot(b_A_83, b_Ai_32, input_precision=DOT_PRECISION) + tl.dot(b_A_84, b_Ai_42, input_precision=DOT_PRECISION) + tl.dot(b_A_85, b_Ai_52, input_precision=DOT_PRECISION) + tl.dot(b_A_86, b_Ai_62, input_precision=DOT_PRECISION) + tl.dot(b_A_87, b_Ai_72, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+#     b_Ai_81 = -tl.dot(b_Ai_88, tl.dot(b_A_81, b_Ai_11, input_precision=DOT_PRECISION) + tl.dot(b_A_82, b_Ai_21, input_precision=DOT_PRECISION) + tl.dot(b_A_83, b_Ai_31, input_precision=DOT_PRECISION) + tl.dot(b_A_84, b_Ai_41, input_precision=DOT_PRECISION) + tl.dot(b_A_85, b_Ai_51, input_precision=DOT_PRECISION) + tl.dot(b_A_86, b_Ai_61, input_precision=DOT_PRECISION) + tl.dot(b_A_87, b_Ai_71, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+
+#     # Store all blocks
+#     if not USE_TMA:
+#         # Diagonal blocks
+#         p_Ai_11 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT, 0), (16, 16), (1, 0))
+#         p_Ai_22 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0))
+#         p_Ai_33 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 32, 32), (16, 16), (1, 0))
+#         p_Ai_44 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 48, 48), (16, 16), (1, 0))
+#         p_Ai_55 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 64, 64), (16, 16), (1, 0))
+#         p_Ai_66 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 80, 80), (16, 16), (1, 0))
+#         p_Ai_77 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 96, 96), (16, 16), (1, 0))
+#         p_Ai_88 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 112, 112), (16, 16), (1, 0))
+#         tl.store(p_Ai_11, b_Ai_11.to(p_Ai_11.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_22, b_Ai_22.to(p_Ai_22.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_33, b_Ai_33.to(p_Ai_33.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_44, b_Ai_44.to(p_Ai_44.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_55, b_Ai_55.to(p_Ai_55.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_66, b_Ai_66.to(p_Ai_66.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_77, b_Ai_77.to(p_Ai_77.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_88, b_Ai_88.to(p_Ai_88.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         # Off-diagonal blocks
+#         p_Ai_21 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0))
+#         p_Ai_31 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 32, 0), (16, 16), (1, 0))
+#         p_Ai_32 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 32, 16), (16, 16), (1, 0))
+#         p_Ai_41 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0))
+#         p_Ai_42 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0))
+#         p_Ai_43 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0))
+#         p_Ai_51 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 64, 0), (16, 16), (1, 0))
+#         p_Ai_52 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 64, 16), (16, 16), (1, 0))
+#         p_Ai_53 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 64, 32), (16, 16), (1, 0))
+#         p_Ai_54 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 64, 48), (16, 16), (1, 0))
+#         p_Ai_61 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 80, 0), (16, 16), (1, 0))
+#         p_Ai_62 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 80, 16), (16, 16), (1, 0))
+#         p_Ai_63 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 80, 32), (16, 16), (1, 0))
+#         p_Ai_64 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 80, 48), (16, 16), (1, 0))
+#         p_Ai_65 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 80, 64), (16, 16), (1, 0))
+#         p_Ai_71 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 96, 0), (16, 16), (1, 0))
+#         p_Ai_72 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 96, 16), (16, 16), (1, 0))
+#         p_Ai_73 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 96, 32), (16, 16), (1, 0))
+#         p_Ai_74 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 96, 48), (16, 16), (1, 0))
+#         p_Ai_75 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 96, 64), (16, 16), (1, 0))
+#         p_Ai_76 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 96, 80), (16, 16), (1, 0))
+#         p_Ai_81 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 112, 0), (16, 16), (1, 0))
+#         p_Ai_82 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 112, 16), (16, 16), (1, 0))
+#         p_Ai_83 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 112, 32), (16, 16), (1, 0))
+#         p_Ai_84 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 112, 48), (16, 16), (1, 0))
+#         p_Ai_85 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 112, 64), (16, 16), (1, 0))
+#         p_Ai_86 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 112, 80), (16, 16), (1, 0))
+#         p_Ai_87 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 112, 96), (16, 16), (1, 0))
+#         tl.store(p_Ai_21, b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_31, b_Ai_31.to(p_Ai_31.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_32, b_Ai_32.to(p_Ai_32.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_41, b_Ai_41.to(p_Ai_41.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_42, b_Ai_42.to(p_Ai_42.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_43, b_Ai_43.to(p_Ai_43.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_51, b_Ai_51.to(p_Ai_51.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_52, b_Ai_52.to(p_Ai_52.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_53, b_Ai_53.to(p_Ai_53.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_54, b_Ai_54.to(p_Ai_54.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_61, b_Ai_61.to(p_Ai_61.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_62, b_Ai_62.to(p_Ai_62.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_63, b_Ai_63.to(p_Ai_63.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_64, b_Ai_64.to(p_Ai_64.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_65, b_Ai_65.to(p_Ai_65.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_71, b_Ai_71.to(p_Ai_71.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_72, b_Ai_72.to(p_Ai_72.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_73, b_Ai_73.to(p_Ai_73.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_74, b_Ai_74.to(p_Ai_74.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_75, b_Ai_75.to(p_Ai_75.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_76, b_Ai_76.to(p_Ai_76.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_81, b_Ai_81.to(p_Ai_81.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_82, b_Ai_82.to(p_Ai_82.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_83, b_Ai_83.to(p_Ai_83.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_84, b_Ai_84.to(p_Ai_84.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_85, b_Ai_85.to(p_Ai_85.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_86, b_Ai_86.to(p_Ai_86.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#         tl.store(p_Ai_87, b_Ai_87.to(p_Ai_87.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+#     else:
+#         # Diagonal blocks
+#         desc_o.store([i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 16, 16], b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 32, 32], b_Ai_33.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 48, 48], b_Ai_44.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 64, 64], b_Ai_55.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 80, 80], b_Ai_66.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 96, 96], b_Ai_77.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 112, 112], b_Ai_88.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         # Off-diagonal blocks
+#         desc_o.store([i_t * BT + 16, 0], b_Ai_21.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 32, 0], b_Ai_31.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 32, 16], b_Ai_32.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 48, 0], b_Ai_41.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 48, 16], b_Ai_42.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 48, 32], b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 64, 0], b_Ai_51.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 64, 16], b_Ai_52.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 64, 32], b_Ai_53.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 64, 48], b_Ai_54.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 80, 0], b_Ai_61.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 80, 16], b_Ai_62.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 80, 32], b_Ai_63.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 80, 48], b_Ai_64.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 80, 64], b_Ai_65.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 96, 0], b_Ai_71.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 96, 16], b_Ai_72.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 96, 32], b_Ai_73.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 96, 48], b_Ai_74.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 96, 64], b_Ai_75.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 96, 80], b_Ai_76.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 112, 0], b_Ai_81.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 112, 16], b_Ai_82.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 112, 32], b_Ai_83.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 112, 48], b_Ai_84.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 112, 64], b_Ai_85.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 112, 80], b_Ai_86.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#         desc_o.store([i_t * BT + 112, 96], b_Ai_87.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+
+import triton
+import triton.language as tl
+
 @triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [4, 8]
-        for num_stages in [2, 3, 4]
+        triton.Config({}, num_warps=nw, num_stages=ns)
+        for nw in (2, 4, 8)
+        for ns in (2, 3, 4, 5)
     ],
-    key=['H', 'BT', 'IS_VARLEN'],
+    key=["H", "BT", "IS_VARLEN", "NB"],   # NB added so tuning respects block size
 )
-@triton.jit(do_not_specialize=['T'])
-def merge_16x16_to_128x128_inverse_kernel(
-    A,
-    Ai,
-    cu_seqlens,
-    chunk_indices,
-    T,
+@triton.jit(do_not_specialize=["T"])
+def merge_16x16_to_nxn_inverse_kernel(
+    A,              # [T, BT] per-head plane, row stride = H*BT, col stride = 1
+    Ai,             # [T, BT] output inverse, same layout
+    cu_seqlens,     # [B+1] or None
+    chunk_indices,  # [num_chunks, 2] (i_n, i_t) when varlen else None
+    T,              # seq len per batch item if fixed
     H: tl.constexpr,
     BT: tl.constexpr,
-    USE_TMA: tl.constexpr,
+    NB: tl.constexpr,            # number of 16x16 sub-blocks per side; N = 16*NB
+    USE_TMA: tl.constexpr,       # kept for API symmetry; unused (manual path)
     IS_VARLEN: tl.constexpr,
-    DOT_PRECISION: tl.constexpr
+    DOT_PRECISION: tl.constexpr, # e.g. "high" or "tf32"
 ):
-    """Process 128x128 matrix as 8x8 blocks of 16x16 sub-matrices."""
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    # -------- program coordinates --------
+    i_t_pid, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-    else:
-        bos, eos = i_b * T, i_b * T + T
 
-    o_i = tl.arange(0, 16)
-    m_A = o_i[:, None] > o_i[None, :]
-    m_I = o_i[:, None] == o_i[None, :]
-    A += (bos * H + i_h) * BT
+    # -------- resolve BOS/EOS, T --------
+    # Keep a distinct i_t for address math (avoid shadowing pid)
+    if IS_VARLEN:
+        i_n  = tl.load(chunk_indices + i_t_pid * 2).to(tl.int32)
+        i_t  = tl.load(chunk_indices + i_t_pid * 2 + 1).to(tl.int32)
+        bos  = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos  = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T    = eos - bos
+    else:
+        i_t  = i_t_pid
+        bos  = i_b * T
+        eos  = bos + T
+
+    # base plane advance for this head
+    A  += (bos * H + i_h) * BT
     Ai += (bos * H + i_h) * BT
 
-    # Initialize descriptors once
-    if USE_TMA:
-        desc = make_tensor_descriptor(A, [T, BT], [H*BT, 1], [16, 16])
-        desc_o = make_tensor_descriptor(Ai, [T, BT], [H*BT, 1], [16, 16])
+    # -------- constants / masks --------
+    BLK = 16
+    # Host should guard: 16*NB <= BT
+    N   = NB * BLK
+    o16 = tl.arange(0, BLK)    # [0..15]
 
-    # Process all 8 diagonal 16x16 blocks
-    b_Ai_diag = []
-    for d in range(8):
-        if not USE_TMA:
-            p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + d * 16, d * 16), (16, 16), (1, 0))
-            b_Ai = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-        else:
-            b_Ai = desc.load([i_t * BT + d * 16, d * 16]).to(tl.float32)
-        
-        b_Ai = -tl.where(m_A, b_Ai, 0)
-        
-        # Process the diagonal block
-        for i in range(2, min(16, T - i_t * BT - d * 16)):
-            b_a = -tl.load(A + (i_t * BT + d * 16 + i) * H*BT + o_i + d * 16)
-            b_a += tl.sum(b_a[:, None] * b_Ai, 0)
-            b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
-        
-        b_Ai += m_I
-        b_Ai_diag.append(b_Ai)
-    
-    # Store diagonal blocks
-    if not USE_TMA:
-        for d in range(8):
-            p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + d * 16, d * 16), (16, 16), (1, 0))
-            tl.store(p_Ai, b_Ai_diag[d].to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-    else:
-        for d in range(8):
-            desc_o.store([i_t * BT + d * 16, d * 16], b_Ai_diag[d].to(desc_o.dtype, fp_downcast_rounding="rtne"))
-    
-    # Process off-diagonal blocks - need to handle dependencies correctly
-    # For lower triangular inverse: Ai[i,j] = -Ai[i,i] * sum(A[i,k] * Ai[k,j]) for k in j..i-1
-    b_Ai_blocks = {}
-    
-    for row in range(1, 8):
-        for col in range(row):
-            if not USE_TMA:
-                p_A_ij = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                b_A_ij = tl.load(p_A_ij, boundary_check=(0, 1)).to(tl.float32)
-            else:
-                b_A_ij = desc.load([i_t * BT + row * 16, col * 16]).to(tl.float32)
-            
-            # Accumulate sum(A[row,k] * Ai[k,col]) for k in col..row-1
-            if col == row - 1:
-                # Direct neighbor: Ai[row,col] = -Ai[row,row] * A[row,col] * Ai[col,col]
-                b_Ai_ij = -tl.dot(tl.dot(b_Ai_diag[row], b_A_ij, input_precision=DOT_PRECISION), 
-                                 b_Ai_diag[col], input_precision=DOT_PRECISION)
-            else:
-                # Need to accumulate intermediate terms
-                b_sum = tl.dot(b_A_ij, b_Ai_diag[col], input_precision=DOT_PRECISION)
-                
-                # Add contributions from intermediate blocks
-                for k in range(col + 1, row):
-                    if not USE_TMA:
-                        p_A_rk = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + row * 16, k * 16), (16, 16), (1, 0))
-                        b_A_rk = tl.load(p_A_rk, boundary_check=(0, 1)).to(tl.float32)
-                    else:
-                        b_A_rk = desc.load([i_t * BT + row * 16, k * 16]).to(tl.float32)
-                    
-                    # Get Ai[k,col] - either diagonal or previously computed
-                    if k == col:
-                        b_Ai_kc = b_Ai_diag[k]
-                    else:
-                        b_Ai_kc = b_Ai_blocks.get((k, col))
-                        if b_Ai_kc is None:
-                            # This shouldn't happen if we process in correct order
-                            continue
-                    
-                    b_sum = b_sum + tl.dot(b_A_rk, b_Ai_kc, input_precision=DOT_PRECISION)
-                
-                b_Ai_ij = -tl.dot(b_Ai_diag[row], b_sum, input_precision=DOT_PRECISION)
-            
-            # Store in dictionary for later use
-            b_Ai_blocks[(row, col)] = b_Ai_ij
-            
-            # Store off-diagonal block
-            if not USE_TMA:
-                p_Ai_ij = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                tl.store(p_Ai_ij, b_Ai_ij.to(p_Ai_ij.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-            else:
-                desc_o.store([i_t * BT + row * 16, col * 16], b_Ai_ij.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+    # masks inside a 16x16 tile
+    m_strict_lower = o16[:, None] >  o16[None, :]
+    m_eye          = o16[:, None] == o16[None, :]
+
+    # ===== 1) Invert all diagonal 16x16 blocks L_ii =====
+    row_base = i_t * BT
+
+    for b in range(NB):
+        r0 = row_base + b * BLK
+        c0 = b * BLK
+
+        # L_ii = I + A_ii, but A stores just the strictly-lower part; identity added later
+        p_Lbb = tl.make_block_ptr(A,  (T, BT), (H * BT, 1), (r0, c0), (BLK, BLK), (1, 0))
+        Lbb   = tl.load(p_Lbb, boundary_check=(0, 1)).to(tl.float32)
+
+        # Start from - strictly-lower(L_ii) = -A_ii
+        Inv_bb = -tl.where(m_strict_lower, Lbb, 0.0)
+
+        # Complete rows i_local=2..15 via finite Neumann/forward-sub
+        for i_local in range(2, BLK):
+            row_idx = r0 + i_local
+            col_vec = c0 + o16
+
+            # Fetch the strict-lower row of A_ii (safe near tail)
+            row_vals = tl.load(
+                A + row_idx * (H * BT) + col_vec,
+                mask=(row_idx < T) & (col_vec < BT),
+                other=0.0,
+            ).to(tl.float32)
+
+            # b_row := -A[i,:] + (-A[i,:]) @ Inv_bb   (only j<i contributes)
+            b_row = -row_vals
+            # (1,BLK) = (1,BLK) @ (BLK,BLK)
+            b_row = b_row + tl.dot(b_row[None, :], Inv_bb, input_precision=DOT_PRECISION)[0, :]
+
+            # Inject into the i_local-th row of Inv_bb
+            Inv_bb = tl.where((o16 == i_local)[:, None], b_row, Inv_bb)
+
+        # Add identity to finish (I + A_ii)^{-1}
+        Inv_bb += m_eye
+
+        # Store back
+        p_Invbb = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0, c0), (BLK, BLK), (1, 0))
+        tl.store(
+            p_Invbb,
+            Inv_bb.to(p_Invbb.dtype.element_ty, fp_downcast_rounding="rtne"),
+            boundary_check=(0, 1),
+        )
+
+    # ===== 2) Off-diagonals: Ai_{ij} for i>j =====
+    for i_blk in range(1, NB):
+        r0_i = row_base + i_blk * BLK
+
+        # Ai_ii already written
+        p_Ai_ii = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_i, i_blk * BLK), (BLK, BLK), (1, 0))
+        Ai_ii   = tl.load(p_Ai_ii, boundary_check=(0, 1)).to(tl.float32)
+
+        for j_blk in range(0, i_blk):
+            c0_j = j_blk * BLK
+
+            # S = sum_{k=j}^{i-1} L_{ik} * Ai_{kj}
+            S = tl.zeros((BLK, BLK), dtype=tl.float32)
+            for k_blk in range(j_blk, i_blk):
+                p_L_ik = tl.make_block_ptr(A,  (T, BT), (H * BT, 1), (r0_i, k_blk * BLK), (BLK, BLK), (1, 0))
+                L_ik   = tl.load(p_L_ik, boundary_check=(0, 1)).to(tl.float32)
+
+                r0_k   = row_base + k_blk * BLK
+                p_Ai_kj = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_k, c0_j), (BLK, BLK), (1, 0))
+                Ai_kj   = tl.load(p_Ai_kj, boundary_check=(0, 1)).to(tl.float32)
+
+                S += tl.dot(L_ik, Ai_kj, input_precision=DOT_PRECISION)
+
+            # Ai_{ij} = - Ai_{ii} * S
+            Ai_ij = -tl.dot(Ai_ii, S, input_precision=DOT_PRECISION)
+
+            p_Ai_ij = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_i, c0_j), (BLK, BLK), (1, 0))
+            tl.store(
+                p_Ai_ij,
+                Ai_ij.to(p_Ai_ij.dtype.element_ty, fp_downcast_rounding="rtne"),
+                boundary_check=(0, 1),
+            )
 
 
-@triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
-})
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [8, 16]
-        for num_stages in [2, 3]
-    ],
-    key=['H', 'BT', 'IS_VARLEN'],
-)
-@triton.jit(do_not_specialize=['T'])
-def merge_16x16_to_256x256_inverse_kernel(
-    A,
-    Ai,
-    cu_seqlens,
-    chunk_indices,
-    T,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    USE_TMA: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    DOT_PRECISION: tl.constexpr
-):
-    """
-    Process 256x256 matrix as 16x16 blocks of 16x16 sub-matrices.
-    Due to memory constraints, we process this hierarchically:
-    First handle 4x4 super-blocks of 64x64, where each 64x64 contains 4x4 blocks of 16x16.
-    """
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    i_b, i_h = i_bh // H, i_bh % H
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-    else:
-        bos, eos = i_b * T, i_b * T + T
+# @triton.heuristics({
+#     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+# })
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_warps=nw, num_stages=ns)
+#         for nw in (2, 4, 8)
+#         for ns in (2, 3, 4, 5)
+#     ],
+#     key=["H", "BT", "IS_VARLEN"],
+# )
+# @triton.jit(do_not_specialize=["T"])
+# def merge_16x16_to_nxn_inverse_kernel(
+#     A,              # [T, BT] per-head plane, row stride = H*BT, col stride = 1
+#     Ai,             # [T, BT] output inverse, same layout
+#     cu_seqlens,     # [B+1] or None
+#     chunk_indices,  # [num_chunks, 2] (i_n, i_t) when varlen else None
+#     T,              # seq len per batch item if fixed
+#     H: tl.constexpr,
+#     BT: tl.constexpr,
+#     NB: tl.constexpr,            # number of 16x16 sub-blocks per side; N = 16*NB
+#     USE_TMA: tl.constexpr,       # kept for API symmetry; must be False here
+#     IS_VARLEN: tl.constexpr,
+#     DOT_PRECISION: tl.constexpr, # e.g. "high" or "tf32"
+# ):
+#     # Compile-time guardrails (informal; Triton lacks static_assert):
+#     # - Requires NB >= 1 and 16*NB <= BT (NxN block fits the tile columns).
+#     # - L (top-left NxN block in the tile) must be unit-lower triangular.
 
-    o_i = tl.arange(0, 16)
-    m_A = o_i[:, None] > o_i[None, :]
-    m_I = o_i[:, None] == o_i[None, :]
-    A += (bos * H + i_h) * BT
-    Ai += (bos * H + i_h) * BT
+#     # -------- program coordinates --------
+#     it, i_bh = tl.program_id(0), tl.program_id(1)
+#     i_b, i_h = i_bh // H, i_bh % H
 
-    # Initialize descriptors once
-    if USE_TMA:
-        desc = make_tensor_descriptor(A, [T, BT], [H*BT, 1], [16, 16])
-        desc_o = make_tensor_descriptor(Ai, [T, BT], [H*BT, 1], [16, 16])
+#     # -------- resolve BOS/EOS, T --------
+#     if IS_VARLEN:
+#         i_n = tl.load(chunk_indices + it * 2).to(tl.int32)
+#         it  = tl.load(chunk_indices + it * 2 + 1).to(tl.int32)
+#         bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+#         eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+#         T   = eos - bos
+#     else:
+#         bos = i_b * T
+#         eos = bos + T
 
-    # Step 1: Process the first 4 diagonal blocks (0-3) and their interactions
-    # These form the top-left 64x64 super-block
-    b_Ai_11 = []  # First 4 diagonal blocks
-    for d in range(4):
-        if not USE_TMA:
-            p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + d * 16, d * 16), (16, 16), (1, 0))
-            b_Ai = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-        else:
-            b_Ai = desc.load([i_t * BT + d * 16, d * 16]).to(tl.float32)
-        
-        b_Ai = -tl.where(m_A, b_Ai, 0)
-        for i in range(2, min(16, T - i_t * BT - d * 16)):
-            b_a = -tl.load(A + (i_t * BT + d * 16 + i) * H*BT + o_i + d * 16)
-            b_a += tl.sum(b_a[:, None] * b_Ai, 0)
-            b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
-        b_Ai += m_I
-        b_Ai_11.append(b_Ai)
-        
-        # Store diagonal block
-        if not USE_TMA:
-            p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + d * 16, d * 16), (16, 16), (1, 0))
-            tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        else:
-            desc_o.store([i_t * BT + d * 16, d * 16], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-    
-    # Process off-diagonal blocks within first 64x64
-    for row in range(1, 4):
-        for col in range(row):
-            if not USE_TMA:
-                p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                b_A = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-            else:
-                b_A = desc.load([i_t * BT + row * 16, col * 16]).to(tl.float32)
-            
-            b_Ai = -tl.dot(tl.dot(b_Ai_11[row], b_A, input_precision=DOT_PRECISION), 
-                          b_Ai_11[col], input_precision=DOT_PRECISION)
-            
-            if not USE_TMA:
-                p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-            else:
-                desc_o.store([i_t * BT + row * 16, col * 16], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-    
-    # Step 2: Process diagonal blocks 4-7 (second 64x64 super-block)
-    b_Ai_22 = []
-    for d in range(4, 8):
-        if not USE_TMA:
-            p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + d * 16, d * 16), (16, 16), (1, 0))
-            b_Ai = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-        else:
-            b_Ai = desc.load([i_t * BT + d * 16, d * 16]).to(tl.float32)
-        
-        b_Ai = -tl.where(m_A, b_Ai, 0)
-        for i in range(2, min(16, T - i_t * BT - d * 16)):
-            b_a = -tl.load(A + (i_t * BT + d * 16 + i) * H*BT + o_i + d * 16)
-            b_a += tl.sum(b_a[:, None] * b_Ai, 0)
-            b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
-        b_Ai += m_I
-        b_Ai_22.append(b_Ai)
-        
-        if not USE_TMA:
-            p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + d * 16, d * 16), (16, 16), (1, 0))
-            tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        else:
-            desc_o.store([i_t * BT + d * 16, d * 16], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-    
-    # Process off-diagonal blocks within second 64x64
-    for row in range(5, 8):
-        for col in range(4, row):
-            if not USE_TMA:
-                p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                b_A = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-            else:
-                b_A = desc.load([i_t * BT + row * 16, col * 16]).to(tl.float32)
-            
-            b_Ai = -tl.dot(tl.dot(b_Ai_22[row-4], b_A, input_precision=DOT_PRECISION), 
-                          b_Ai_22[col-4], input_precision=DOT_PRECISION)
-            
-            if not USE_TMA:
-                p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-            else:
-                desc_o.store([i_t * BT + row * 16, col * 16], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-    
-    # Process blocks connecting super-block 2 to super-block 1 (rows 4-7, cols 0-3)
-    for row in range(4, 8):
-        for col in range(min(4, row)):
-            if not USE_TMA:
-                p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                b_A = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-            else:
-                b_A = desc.load([i_t * BT + row * 16, col * 16]).to(tl.float32)
-            
-            b_Ai = -tl.dot(tl.dot(b_Ai_22[row-4], b_A, input_precision=DOT_PRECISION), 
-                          b_Ai_11[col], input_precision=DOT_PRECISION)
-            
-            if not USE_TMA:
-                p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-            else:
-                desc_o.store([i_t * BT + row * 16, col * 16], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-    
-    # Step 3: Process diagonal blocks 8-11 (third 64x64 super-block)
-    b_Ai_33 = []
-    for d in range(8, 12):
-        if not USE_TMA:
-            p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + d * 16, d * 16), (16, 16), (1, 0))
-            b_Ai = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-        else:
-            b_Ai = desc.load([i_t * BT + d * 16, d * 16]).to(tl.float32)
-        
-        b_Ai = -tl.where(m_A, b_Ai, 0)
-        for i in range(2, min(16, T - i_t * BT - d * 16)):
-            b_a = -tl.load(A + (i_t * BT + d * 16 + i) * H*BT + o_i + d * 16)
-            b_a += tl.sum(b_a[:, None] * b_Ai, 0)
-            b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
-        b_Ai += m_I
-        b_Ai_33.append(b_Ai)
-        
-        if not USE_TMA:
-            p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + d * 16, d * 16), (16, 16), (1, 0))
-            tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        else:
-            desc_o.store([i_t * BT + d * 16, d * 16], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-    
-    # Process off-diagonal blocks within third 64x64 and connections to previous blocks
-    for row in range(8, 12):
-        # Within same super-block
-        for col in range(8, row):
-            if not USE_TMA:
-                p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                b_A = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-            else:
-                b_A = desc.load([i_t * BT + row * 16, col * 16]).to(tl.float32)
-            
-            b_Ai = -tl.dot(tl.dot(b_Ai_33[row-8], b_A, input_precision=DOT_PRECISION), 
-                          b_Ai_33[col-8], input_precision=DOT_PRECISION)
-            
-            if not USE_TMA:
-                p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-            else:
-                desc_o.store([i_t * BT + row * 16, col * 16], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        
-        # Connections to first two super-blocks (simplified - only direct connections)
-        for col in range(min(8, row)):
-            if not USE_TMA:
-                p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                b_A = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-            else:
-                b_A = desc.load([i_t * BT + row * 16, col * 16]).to(tl.float32)
-            
-            if col < 4:
-                b_Ai = -tl.dot(tl.dot(b_Ai_33[row-8], b_A, input_precision=DOT_PRECISION), 
-                              b_Ai_11[col], input_precision=DOT_PRECISION)
-            else:
-                b_Ai = -tl.dot(tl.dot(b_Ai_33[row-8], b_A, input_precision=DOT_PRECISION), 
-                              b_Ai_22[col-4], input_precision=DOT_PRECISION)
-            
-            if not USE_TMA:
-                p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-            else:
-                desc_o.store([i_t * BT + row * 16, col * 16], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-    
-    # Step 4: Process diagonal blocks 12-15 (fourth 64x64 super-block)
-    b_Ai_44 = []
-    for d in range(12, 16):
-        if not USE_TMA:
-            p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + d * 16, d * 16), (16, 16), (1, 0))
-            b_Ai = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-        else:
-            b_Ai = desc.load([i_t * BT + d * 16, d * 16]).to(tl.float32)
-        
-        b_Ai = -tl.where(m_A, b_Ai, 0)
-        for i in range(2, min(16, T - i_t * BT - d * 16)):
-            b_a = -tl.load(A + (i_t * BT + d * 16 + i) * H*BT + o_i + d * 16)
-            b_a += tl.sum(b_a[:, None] * b_Ai, 0)
-            b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
-        b_Ai += m_I
-        b_Ai_44.append(b_Ai)
-        
-        if not USE_TMA:
-            p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + d * 16, d * 16), (16, 16), (1, 0))
-            tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        else:
-            desc_o.store([i_t * BT + d * 16, d * 16], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-    
-    # Process remaining off-diagonal blocks
-    for row in range(12, 16):
-        # Within same super-block
-        for col in range(12, row):
-            if not USE_TMA:
-                p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                b_A = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-            else:
-                b_A = desc.load([i_t * BT + row * 16, col * 16]).to(tl.float32)
-            
-            b_Ai = -tl.dot(tl.dot(b_Ai_44[row-12], b_A, input_precision=DOT_PRECISION), 
-                          b_Ai_44[col-12], input_precision=DOT_PRECISION)
-            
-            if not USE_TMA:
-                p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-            else:
-                desc_o.store([i_t * BT + row * 16, col * 16], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        
-        # Connections to previous super-blocks (simplified)
-        for col in range(min(12, row)):
-            if not USE_TMA:
-                p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                b_A = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
-            else:
-                b_A = desc.load([i_t * BT + row * 16, col * 16]).to(tl.float32)
-            
-            if col < 4:
-                b_Ai = -tl.dot(tl.dot(b_Ai_44[row-12], b_A, input_precision=DOT_PRECISION), 
-                              b_Ai_11[col], input_precision=DOT_PRECISION)
-            elif col < 8:
-                b_Ai = -tl.dot(tl.dot(b_Ai_44[row-12], b_A, input_precision=DOT_PRECISION), 
-                              b_Ai_22[col-4], input_precision=DOT_PRECISION)
-            else:
-                b_Ai = -tl.dot(tl.dot(b_Ai_44[row-12], b_A, input_precision=DOT_PRECISION), 
-                              b_Ai_33[col-8], input_precision=DOT_PRECISION)
-            
-            if not USE_TMA:
-                p_Ai = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + row * 16, col * 16), (16, 16), (1, 0))
-                tl.store(p_Ai, b_Ai.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-            else:
-                desc_o.store([i_t * BT + row * 16, col * 16], b_Ai.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+#     # base plane advance for this head
+#     A  += (bos * H + i_h) * BT
+#     Ai += (bos * H + i_h) * BT
+
+#     # -------- constants / masks --------
+#     BLK = 16
+#     N   = NB * BLK             # side length of the block we invert
+#     o16 = tl.arange(0, BLK)    # [0..15]
+
+#     # masks inside a 16x16 tile
+#     m_strict_lower = o16[:, None] >  o16[None, :]
+#     m_eye          = o16[:, None] == o16[None, :]
+
+#     # Invert all diagonal 16x16 blocks L_ii
+#     # Each L_ii is unit-lower. We mirror your 64x64 scheme:
+#     # start from -strict_lower, then complete rows i=2..15 by accumulating
+#     # contributions from the already-built rows, then add identity.
+
+#     # NOTE: rows of the NxN block start at row_base = it*BT
+#     row_base = it * BT
+
+#     for b in range(NB):
+#         r0 = row_base + b * BLK
+#         c0 = b * BLK
+
+#         # Load the 16x16 diagonal block
+#         p_Lbb = tl.make_block_ptr(A,  (T, BT), (H * BT, 1), (r0, c0), (BLK, BLK), (1, 0))
+#         Lbb   = tl.load(p_Lbb, boundary_check=(0, 1)).to(tl.float32)
+
+#         # Start from -strictly-lower part
+#         Inv_bb = -tl.where(m_strict_lower, Lbb, 0.0)
+
+#         # Complete rows i_local=2..15 (row 0/1 already correct for unit-lower)
+#         # Re-load rows from A to mimic original numerical pathway (safe with masks).
+#         for i_local in range(2, BLK):
+#             row_idx = r0 + i_local
+#             col_vec = c0 + o16
+
+#             # Read the i_local-th row of this 16x16 block from global, masked near tail
+#             row_vals = tl.load(
+#                 A + row_idx * (H * BT) + col_vec,
+#                 mask=(row_idx < T) & (col_vec < BT),
+#                 other=0.0,
+#             ).to(tl.float32)
+
+#             # Forward-sub accumulation into inverse row (matches your recurrence)
+#             # b_row := -L[i,:] + sum_j b_row[j] * Inv_bb[j,:]
+#             b_row = -row_vals
+#             b_row += tl.sum(b_row[:, None] * Inv_bb, axis=0)
+
+#             # Inject into the i_local-th row of Inv_bb
+#             Inv_bb = tl.where((o16 == i_local)[:, None], b_row, Inv_bb)
+
+#         # Add identity to finish L_ii^{-1}
+#         Inv_bb += m_eye
+
+#         # Store back
+#         p_Invbb = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0, c0), (BLK, BLK), (1, 0))
+#         tl.store(
+#             p_Invbb,
+#             Inv_bb.to(p_Invbb.dtype.element_ty, fp_downcast_rounding="rtne"),
+#             boundary_check=(0, 1),
+#         )
+
+#     # Off-diagonals: (i>j)
+#     # For each row block i, cache Ai_ii once; then for each j<i:
+#     #   S = sum_{k=j}^{i-1} L_{ik} * Ai_{kj}
+#     #   Ai_{ij} = - Ai_{ii} * S
+
+#     for i_blk in range(1, NB):
+#         r0_i = row_base + i_blk * BLK
+
+#         # Load Ai_ii
+#         p_Ai_ii = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_i, i_blk * BLK), (BLK, BLK), (1, 0))
+#         Ai_ii   = tl.load(p_Ai_ii, boundary_check=(0, 1)).to(tl.float32)
+
+#         for j_blk in range(0, i_blk):
+#             c0_j = j_blk * BLK
+
+#             # Accumulator for S
+#             S = tl.zeros((BLK, BLK), dtype=tl.float32)
+
+#             for k_blk in range(j_blk, i_blk):
+#                 # L_{ik}
+#                 p_L_ik = tl.make_block_ptr(A,  (T, BT), (H * BT, 1), (r0_i, k_blk * BLK), (BLK, BLK), (1, 0))
+#                 L_ik   = tl.load(p_L_ik, boundary_check=(0, 1)).to(tl.float32)
+
+#                 # Ai_{kj}
+#                 r0_k   = row_base + k_blk * BLK
+#                 p_Ai_kj = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_k, c0_j), (BLK, BLK), (1, 0))
+#                 Ai_kj   = tl.load(p_Ai_kj, boundary_check=(0, 1)).to(tl.float32)
+
+#                 S += tl.dot(L_ik, Ai_kj, input_precision=DOT_PRECISION)
+
+#             # Ai_{ij} = -Ai_{ii} * S
+#             Ai_ij = -tl.dot(Ai_ii, S, input_precision=DOT_PRECISION)
+
+#             # Store
+#             p_Ai_ij = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_i, c0_j), (BLK, BLK), (1, 0))
+#             tl.store(
+#                 p_Ai_ij,
+#                 Ai_ij.to(p_Ai_ij.dtype.element_ty, fp_downcast_rounding="rtne"),
+#                 boundary_check=(0, 1),
+#             )
+
 
 
 @input_guard
@@ -760,7 +1018,7 @@ def solve_tril(
     Returns:
         (I + A)^-1 with the same shape as A
     """
-    assert A.shape[-1] in [16, 32, 64, 128, 256]
+    assert A.shape[-1] in [16, 32, 64, 128, 256, 512]
     output_dtype = A.dtype if output_dtype is None else output_dtype
 
     B, T, H, BT = A.shape
@@ -774,10 +1032,8 @@ def solve_tril(
         merge_fn = merge_16x16_to_32x32_inverse_kernel
     elif BT == 64:
         merge_fn = merge_16x16_to_64x64_inverse_kernel
-    elif BT == 128:
-        merge_fn = merge_16x16_to_128x128_inverse_kernel
-    elif BT == 256:
-        merge_fn = merge_16x16_to_256x256_inverse_kernel
+    elif BT >= 128: 
+        merge_fn = merge_16x16_to_nxn_inverse_kernel
 
     merge_fn[NT, B * H](
         A=A,
