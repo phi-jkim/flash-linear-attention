@@ -134,7 +134,7 @@ def chunk_gated_delta_product_bwd(
         cu_seqlens=cu_seqlens_dp,
         output_dtype=torch.float32, 
         # chunk_size=64*num_householder,
-        chunk_size=128,
+        chunk_size=64,
     )
 
     A = solve_tril(
@@ -159,7 +159,7 @@ def chunk_gated_delta_product_bwd(
         output_final_state=False,
         cu_seqlens=cu_seqlens_dp,
         # chunk_size=64*num_householder,
-        chunk_size=128,
+        chunk_size=64,
     )
 
     # Recompute h and v_new using delta product forward
@@ -185,7 +185,7 @@ def chunk_gated_delta_product_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens_dp,
         # chunk_size=64*num_householder,
-        chunk_size=128,
+        chunk_size=64,
     )
 
     from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu
@@ -203,7 +203,7 @@ def chunk_gated_delta_product_bwd(
         cu_seqlens=cu_seqlens_dp,  # use cu_seqlens_dp which is expanded
         # chunk_size=64*num_householder,
         # num_householder=num_householder,
-        chunk_size=128,
+        chunk_size=64,
     )
 
     # from fla.ops.gated_delta_product.chunk_deltaproduct_h import chunk_gated_delta_product_bwd_dhu

@@ -716,7 +716,7 @@ def merge_16x16_to_64x64_inverse_kernel(
         for nw in (2, 4, 8)
         for ns in (2, 3, 4, 5)
     ],
-    key=["H", "BT", "IS_VARLEN", "NB", "BLK"],   # include NB & BLK in key
+    key=["H", "BT", "IS_VARLEN", "NB", "BLK"],  # include NB & BLK in key
 )
 @triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_nxn_inverse_kernel(
@@ -728,8 +728,8 @@ def merge_16x16_to_nxn_inverse_kernel(
     H: tl.constexpr,
     BT: tl.constexpr,
     NB: tl.constexpr,            # number of sub-blocks per side
-    BLK: tl.constexpr,           # <-- NEW (must be 16)
-    USE_TMA: tl.constexpr,
+    BLK: tl.constexpr,           # must be 16
+    USE_TMA: tl.constexpr,       # unused (manual path)
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
@@ -754,12 +754,11 @@ def merge_16x16_to_nxn_inverse_kernel(
     Ai += (bos * H + i_h) * BT
 
     # compile-time shapes derived from BLK
-    # N = NB * BLK  # (optional; not used directly)
     o16 = tl.arange(0, BLK)              # requires BLK constexpr
     m_strict_lower = o16[:, None] > o16[None, :]
     m_eye          = o16[:, None] == o16[None, :]
 
-    # ===== 1) invert diagonal BLK×BLK blocks =====
+    #  invert diagonal BLK×BLK blocks =====
     row_base = i_t * BT
     for b in range(NB):
         r0 = row_base + b * BLK
@@ -777,15 +776,20 @@ def merge_16x16_to_nxn_inverse_kernel(
                 mask=(row_idx < T) & (col_vec < BT),
                 other=0.0,
             ).to(tl.float32)
+            # Use elementwise-mul + reduction (avoids MMA min-size constraint)
             b_row = -row_vals
-            b_row = b_row + tl.dot(b_row[None, :], Inv_bb, input_precision=DOT_PRECISION)[0, :]
+            b_row = b_row + tl.sum(b_row[:, None] * Inv_bb, axis=0)
             Inv_bb = tl.where((o16 == i_local)[:, None], b_row, Inv_bb)
 
         Inv_bb += m_eye
         p_Invbb = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (r0, c0), (BLK, BLK), (1, 0))
-        tl.store(p_Invbb, Inv_bb.to(p_Invbb.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+        tl.store(
+            p_Invbb,
+            Inv_bb.to(p_Invbb.dtype.element_ty, fp_downcast_rounding="rtne"),
+            boundary_check=(0, 1)
+        )
 
-    # ===== off-diagonals =====
+    # off-diagonals =====
     for i_blk in range(1, NB):
         r0_i = row_base + i_blk * BLK
         p_Ai_ii = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (r0_i, i_blk * BLK), (BLK, BLK), (1, 0))
@@ -804,7 +808,11 @@ def merge_16x16_to_nxn_inverse_kernel(
 
             Ai_ij = -tl.dot(Ai_ii, S, input_precision=DOT_PRECISION)
             p_Ai_ij = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (r0_i, c0_j), (BLK, BLK), (1, 0))
-            tl.store(p_Ai_ij, Ai_ij.to(p_Ai_ij.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+            tl.store(
+                p_Ai_ij,
+                Ai_ij.to(p_Ai_ij.dtype.element_ty, fp_downcast_rounding="rtne"),
+                boundary_check=(0, 1)
+            )
 
 
 # @triton.heuristics({
@@ -988,41 +996,42 @@ def solve_tril(
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
     Ai = torch.zeros_like(A, dtype=output_dtype)
-    if BT == 16:
-        merge_fn = solve_tril_16x16_kernel
-    elif BT == 32:
-        merge_fn = merge_16x16_to_32x32_inverse_kernel
-    elif BT == 64:
-        merge_fn = merge_16x16_to_64x64_inverse_kernel
-    elif BT >= 128: 
-        merge_fn = merge_16x16_to_nxn_inverse_kernel
+    # if BT == 16:
+    #     merge_fn = solve_tril_16x16_kernel
+    # elif BT == 32:
+    #     merge_fn = merge_16x16_to_32x32_inverse_kernel
+    # elif BT == 64:
+    #     merge_fn = merge_16x16_to_64x64_inverse_kernel
+    # elif BT >= 128: 
+    merge_fn = merge_16x16_to_nxn_inverse_kernel
 
-    if BT < 128:
-        merge_fn[NT, B * H](
-            A=A,
-            Ai=Ai,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            T=T,
-            H=H,
-            BT=BT,
-            USE_TMA=is_tma_supported,
-            DOT_PRECISION=FLA_TRIL_PRECISION,
-        )
-    else: 
-        NB = BT // 16
-        merge_fn[NT, B * H](
-            A=A,
-            Ai=Ai,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            T=T,
-            H=H,
-            BT=BT,
-            NB=NB,
-            USE_TMA=is_tma_supported,
-            DOT_PRECISION=FLA_TRIL_PRECISION,
-        )
+    # if BT < 128:
+    #     merge_fn[NT, B * H](
+    #         A=A,
+    #         Ai=Ai,
+    #         cu_seqlens=cu_seqlens,
+    #         chunk_indices=chunk_indices,
+    #         T=T,
+    #         H=H,
+    #         BT=BT,
+    #         USE_TMA=is_tma_supported,
+    #         DOT_PRECISION=FLA_TRIL_PRECISION,
+    #     )
+    # else: 
+    NB = BT // 16
+    merge_fn[NT, B * H](
+        A=A,
+        Ai=Ai,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        BT=BT,
+        NB=NB,
+        BLK=16,
+        USE_TMA=is_tma_supported,
+        DOT_PRECISION=FLA_TRIL_PRECISION,
+    )
     return Ai
 
 
