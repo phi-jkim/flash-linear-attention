@@ -1035,17 +1035,34 @@ def solve_tril(
     elif BT >= 128: 
         merge_fn = merge_16x16_to_nxn_inverse_kernel
 
-    merge_fn[NT, B * H](
-        A=A,
-        Ai=Ai,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        BT=BT,
-        USE_TMA=is_tma_supported,
-        DOT_PRECISION=FLA_TRIL_PRECISION,
-    )
+    if BT < 128:
+        merge_fn[NT, B * H](
+            A=A,
+            Ai=Ai,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            BT=BT,
+            USE_TMA=is_tma_supported,
+            DOT_PRECISION=FLA_TRIL_PRECISION,
+        )
+    else: 
+        NB = BT // 16
+        merge_fn[NT, B * H](
+            A=A,
+            Ai=Ai,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            BT=BT,
+            NB=NB,
+            USE_TMA=is_tma_supported,
+            DOT_PRECISION=FLA_TRIL_PRECISION,
+        )
     return Ai
+
+
 
 
