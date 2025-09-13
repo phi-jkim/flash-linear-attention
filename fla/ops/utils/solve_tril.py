@@ -814,158 +814,6 @@ def merge_16x16_to_nxn_inverse_kernel(
                 boundary_check=(0, 1)
             )
 
-
-# @triton.heuristics({
-#     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-# })
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=nw, num_stages=ns)
-#         for nw in (2, 4, 8)
-#         for ns in (2, 3, 4, 5)
-#     ],
-#     key=["H", "BT", "IS_VARLEN"],
-# )
-# @triton.jit(do_not_specialize=["T"])
-# def merge_16x16_to_nxn_inverse_kernel(
-#     A,              # [T, BT] per-head plane, row stride = H*BT, col stride = 1
-#     Ai,             # [T, BT] output inverse, same layout
-#     cu_seqlens,     # [B+1] or None
-#     chunk_indices,  # [num_chunks, 2] (i_n, i_t) when varlen else None
-#     T,              # seq len per batch item if fixed
-#     H: tl.constexpr,
-#     BT: tl.constexpr,
-#     NB: tl.constexpr,            # number of 16x16 sub-blocks per side; N = 16*NB
-#     USE_TMA: tl.constexpr,       # kept for API symmetry; must be False here
-#     IS_VARLEN: tl.constexpr,
-#     DOT_PRECISION: tl.constexpr, # e.g. "high" or "tf32"
-# ):
-#     # Compile-time guardrails (informal; Triton lacks static_assert):
-#     # - Requires NB >= 1 and 16*NB <= BT (NxN block fits the tile columns).
-#     # - L (top-left NxN block in the tile) must be unit-lower triangular.
-
-#     # -------- program coordinates --------
-#     it, i_bh = tl.program_id(0), tl.program_id(1)
-#     i_b, i_h = i_bh // H, i_bh % H
-
-#     # -------- resolve BOS/EOS, T --------
-#     if IS_VARLEN:
-#         i_n = tl.load(chunk_indices + it * 2).to(tl.int32)
-#         it  = tl.load(chunk_indices + it * 2 + 1).to(tl.int32)
-#         bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-#         eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-#         T   = eos - bos
-#     else:
-#         bos = i_b * T
-#         eos = bos + T
-
-#     # base plane advance for this head
-#     A  += (bos * H + i_h) * BT
-#     Ai += (bos * H + i_h) * BT
-
-#     # -------- constants / masks --------
-#     BLK = 16
-#     N   = NB * BLK             # side length of the block we invert
-#     o16 = tl.arange(0, BLK)    # [0..15]
-
-#     # masks inside a 16x16 tile
-#     m_strict_lower = o16[:, None] >  o16[None, :]
-#     m_eye          = o16[:, None] == o16[None, :]
-
-#     # Invert all diagonal 16x16 blocks L_ii
-#     # Each L_ii is unit-lower. We mirror your 64x64 scheme:
-#     # start from -strict_lower, then complete rows i=2..15 by accumulating
-#     # contributions from the already-built rows, then add identity.
-
-#     # NOTE: rows of the NxN block start at row_base = it*BT
-#     row_base = it * BT
-
-#     for b in range(NB):
-#         r0 = row_base + b * BLK
-#         c0 = b * BLK
-
-#         # Load the 16x16 diagonal block
-#         p_Lbb = tl.make_block_ptr(A,  (T, BT), (H * BT, 1), (r0, c0), (BLK, BLK), (1, 0))
-#         Lbb   = tl.load(p_Lbb, boundary_check=(0, 1)).to(tl.float32)
-
-#         # Start from -strictly-lower part
-#         Inv_bb = -tl.where(m_strict_lower, Lbb, 0.0)
-
-#         # Complete rows i_local=2..15 (row 0/1 already correct for unit-lower)
-#         # Re-load rows from A to mimic original numerical pathway (safe with masks).
-#         for i_local in range(2, BLK):
-#             row_idx = r0 + i_local
-#             col_vec = c0 + o16
-
-#             # Read the i_local-th row of this 16x16 block from global, masked near tail
-#             row_vals = tl.load(
-#                 A + row_idx * (H * BT) + col_vec,
-#                 mask=(row_idx < T) & (col_vec < BT),
-#                 other=0.0,
-#             ).to(tl.float32)
-
-#             # Forward-sub accumulation into inverse row (matches your recurrence)
-#             # b_row := -L[i,:] + sum_j b_row[j] * Inv_bb[j,:]
-#             b_row = -row_vals
-#             b_row += tl.sum(b_row[:, None] * Inv_bb, axis=0)
-
-#             # Inject into the i_local-th row of Inv_bb
-#             Inv_bb = tl.where((o16 == i_local)[:, None], b_row, Inv_bb)
-
-#         # Add identity to finish L_ii^{-1}
-#         Inv_bb += m_eye
-
-#         # Store back
-#         p_Invbb = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0, c0), (BLK, BLK), (1, 0))
-#         tl.store(
-#             p_Invbb,
-#             Inv_bb.to(p_Invbb.dtype.element_ty, fp_downcast_rounding="rtne"),
-#             boundary_check=(0, 1),
-#         )
-
-#     # Off-diagonals: (i>j)
-#     # For each row block i, cache Ai_ii once; then for each j<i:
-#     #   S = sum_{k=j}^{i-1} L_{ik} * Ai_{kj}
-#     #   Ai_{ij} = - Ai_{ii} * S
-
-#     for i_blk in range(1, NB):
-#         r0_i = row_base + i_blk * BLK
-
-#         # Load Ai_ii
-#         p_Ai_ii = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_i, i_blk * BLK), (BLK, BLK), (1, 0))
-#         Ai_ii   = tl.load(p_Ai_ii, boundary_check=(0, 1)).to(tl.float32)
-
-#         for j_blk in range(0, i_blk):
-#             c0_j = j_blk * BLK
-
-#             # Accumulator for S
-#             S = tl.zeros((BLK, BLK), dtype=tl.float32)
-
-#             for k_blk in range(j_blk, i_blk):
-#                 # L_{ik}
-#                 p_L_ik = tl.make_block_ptr(A,  (T, BT), (H * BT, 1), (r0_i, k_blk * BLK), (BLK, BLK), (1, 0))
-#                 L_ik   = tl.load(p_L_ik, boundary_check=(0, 1)).to(tl.float32)
-
-#                 # Ai_{kj}
-#                 r0_k   = row_base + k_blk * BLK
-#                 p_Ai_kj = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_k, c0_j), (BLK, BLK), (1, 0))
-#                 Ai_kj   = tl.load(p_Ai_kj, boundary_check=(0, 1)).to(tl.float32)
-
-#                 S += tl.dot(L_ik, Ai_kj, input_precision=DOT_PRECISION)
-
-#             # Ai_{ij} = -Ai_{ii} * S
-#             Ai_ij = -tl.dot(Ai_ii, S, input_precision=DOT_PRECISION)
-
-#             # Store
-#             p_Ai_ij = tl.make_block_ptr(Ai, (T, BT), (H * BT, 1), (r0_i, c0_j), (BLK, BLK), (1, 0))
-#             tl.store(
-#                 p_Ai_ij,
-#                 Ai_ij.to(p_Ai_ij.dtype.element_ty, fp_downcast_rounding="rtne"),
-#                 boundary_check=(0, 1),
-#             )
-
-
-
 @input_guard
 def solve_tril(
     A: torch.Tensor,
@@ -996,42 +844,42 @@ def solve_tril(
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
     Ai = torch.zeros_like(A, dtype=output_dtype)
-    # if BT == 16:
-    #     merge_fn = solve_tril_16x16_kernel
-    # elif BT == 32:
-    #     merge_fn = merge_16x16_to_32x32_inverse_kernel
-    # elif BT == 64:
-    #     merge_fn = merge_16x16_to_64x64_inverse_kernel
-    # elif BT >= 128: 
-    merge_fn = merge_16x16_to_nxn_inverse_kernel
+    if BT == 16:
+        merge_fn = solve_tril_16x16_kernel
+    elif BT == 32:
+        merge_fn = merge_16x16_to_32x32_inverse_kernel
+    elif BT == 64:
+        merge_fn = merge_16x16_to_64x64_inverse_kernel
+    elif BT >= 128: 
+        merge_fn = merge_16x16_to_nxn_inverse_kernel
 
-    # if BT < 128:
-    #     merge_fn[NT, B * H](
-    #         A=A,
-    #         Ai=Ai,
-    #         cu_seqlens=cu_seqlens,
-    #         chunk_indices=chunk_indices,
-    #         T=T,
-    #         H=H,
-    #         BT=BT,
-    #         USE_TMA=is_tma_supported,
-    #         DOT_PRECISION=FLA_TRIL_PRECISION,
-    #     )
-    # else: 
-    NB = BT // 16
-    merge_fn[NT, B * H](
-        A=A,
-        Ai=Ai,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        BT=BT,
-        NB=NB,
-        BLK=16,
-        USE_TMA=is_tma_supported,
-        DOT_PRECISION=FLA_TRIL_PRECISION,
-    )
+    if BT < 128:
+        merge_fn[NT, B * H](
+            A=A,
+            Ai=Ai,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            BT=BT,
+            USE_TMA=is_tma_supported,
+            DOT_PRECISION=FLA_TRIL_PRECISION,
+        )
+    else:    
+        NB = BT // 16
+        merge_fn[NT, B * H](
+            A=A,
+            Ai=Ai,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            BT=BT,
+            NB=NB,
+            BLK=16,
+            USE_TMA=is_tma_supported,
+            DOT_PRECISION=FLA_TRIL_PRECISION,
+        )
     return Ai
 
 

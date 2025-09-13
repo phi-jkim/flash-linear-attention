@@ -153,55 +153,6 @@ def chunk_gated_delta_product_fwd_o(
     )
     return o
 
-def chunk_gated_delta_product_bwd_dv_local(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    do: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    g_gamma: Optional[torch.Tensor] = None,
-    scale: float = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64,
-    num_householder: int = 1,
-) -> torch.Tensor:
-    B, T, H, K, V = *k.shape, do.shape[-1]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    # H100 can have larger block size
-    if check_shared_mem('hopper', k.device.index):
-        CONST_TILING = 128
-    elif check_shared_mem:
-        CONST_TILING = 64
-    else:
-        CONST_TILING = 32
-    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-
-    dv = torch.empty((B, T, H, V), dtype=do.dtype, device=do.device)
-    grid = (NT, B * H)
-    chunk_gated_delta_product_bwd_kernel_dv_local[grid](
-        q=q,
-        k=k,
-        g=g,
-        g_gamma=g_gamma,
-        do=do,
-        dv=dv,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        T=T,
-        H=H,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=BK,
-        BV=BV,
-        num_householder=num_householder,
-    )
-    return dv
-
-
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
@@ -226,114 +177,389 @@ def chunk_gated_delta_product_bwd_kernel_dv_local(
     cu_seqlens,
     chunk_indices,
     scale,
-    T,
+    T,                         # expanded length (length of k/dv/g)
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    BT: tl.constexpr,
+    BT: tl.constexpr,          # compute tile for rows (expanded)
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     USE_G_GAMMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     num_householder: tl.constexpr,
+    expanded_chunk_size: tl.constexpr,   # == BT * next_power_of_2(num_householder)
 ):
+    # ---- program ids
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
 
+    # ---- constants for timeline mapping
+    M = num_householder                     # spacing between non-zeros in expanded q_new/do_new
+    EXP_CHUNK = expanded_chunk_size         # mathematical expanded chunk width
+    BTC = (EXP_CHUNK + M - 1) // M          # ceil(EXP_CHUNK / M): true columns per expanded chunk
+
+    # ---- per-sample bounds in expanded view
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos 
-
-        bos_q_o = bos // num_householder
-        eos_q_o = eos // num_householder
-        
-        T_true = T // num_householder
+        i_n  = tl.load(chunk_indices + i_t * 2 + 0).to(tl.int32)
+        t0   = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)  # tile id at BT granularity (expanded)
+        bos  = tl.load(cu_seqlens + i_n + 0).to(tl.int32)
+        eos  = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        Tloc = eos - bos                                          # expanded length for this sequence
+        bos_true = bos // M
+        T_true   = Tloc // M
+        row_start = t0 * BT                                       # expanded
     else:
-        bos, eos = i_b * T, i_b * T + T
-        T = T
-        T_true = T // num_householder
+        bos  = i_b * T
+        eos  = i_b * T + T
+        Tloc = T
+        bos_true = (bos // M) 
+        T_true   = Tloc // M 
+        row_start = i_t * BT
 
-        bos_q_o = bos // num_householder
-        eos_q_o = eos // num_householder
+    # ---- base pointers (batch/head offsets)
+    # q/do live on TRUE timeline; k/dv/g live on EXPANDED timeline
+    q  += (bos_true * H + i_h) * K
+    do += (bos_true * H + i_h) * V
+    k  += (bos      * H + i_h) * K
+    dv += (bos      * H + i_h) * V
+    if USE_G:
+        g  += (bos      * H + i_h)
 
-    # i_t corresponds to BT actual tokens (0, 1, 2, 3, 4, 5, 6) num householder = 3 
-    # i_tq corresponds to BT * num householder actual tokens 
-    i_tq_o = i_t // num_householder # 0, 1, 2 should correspond to 0 and 3, 4, 5 correspond to 1 
+    # ---- row/col coordinates
+    # rows: expanded, contiguous BT
+    o_row = row_start + tl.arange(0, BT)                   # [BT]
+    m_row = o_row < Tloc
 
-    # index for which BT chunk current thread block corresponds in a block of BT * num householder chunks 
-    i_BT = i_t % num_householder
+    # align columns to the expanded chunk that contains this row tile
+    chunk_lo = (row_start // EXP_CHUNK) * EXP_CHUNK        # expanded-chunk base for this tile
+    j0_true  = chunk_lo // M                               # TRUE start covering this expanded chunk
 
-    # offset calculation
-    # q += (bos * H + i_h) * K
-    q += (bos_q_o * H + i_h) * K
-    k += (bos * H + i_h) * K
-    # do += (bos * H + i_h) * V
-    do += (bos_q_o * H + i_h) * V
-    dv += (bos * H + i_h) * V
+    # columns (expanded) that correspond to TRUE indices in this chunk:
+    # col_exp(j) = j*M + (M-1), j in [j0_true .. j0_true+BTC-1]
+    o_col_exp = j0_true * M + (M - 1) + tl.arange(0, BTC) * M    # [BTC]
+    # fence to both sequence end and this expanded chunk’s right edge
+    m_col_exp = (o_col_exp < Tloc) & (o_col_exp < (chunk_lo + EXP_CHUNK))
 
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        # p_q = tl.make_block_ptr(q, (K, T_true), (1, H*K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
-        p_q = tl.make_block_ptr(q, (K, T_true), (1, H*K), (i_k * BK, i_tq_o * BT), (BK, BT), (0, 1))
-
-        b_q = tl.load(p_q, boundary_check=(0, 1))
+    # ---- build A = K_rows(expanded) @ Q_cols(TRUE)  => [BT, BTC]
+    b_A = tl.zeros([BT, BTC], dtype=tl.float32)
+    for i_kblk in range(tl.cdiv(K, BK)):
+        # K tile (expanded rows)
+        p_k = tl.make_block_ptr(
+            k, (Tloc, K), (H*K, 1),
+            (row_start, i_kblk * BK), (BT, BK), (1, 0)
+        )
         b_k = tl.load(p_k, boundary_check=(0, 1))
+
+        # Q tile (TRUE columns): contiguous block of BTC columns starting at j0_true
+        p_q = tl.make_block_ptr(
+            q, (K, T_true), (1, H*K),
+            (i_kblk * BK, j0_true), (BK, BTC), (0, 1)
+        )
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+
         b_A += tl.dot(b_k, b_q)
 
+    # ---- strict triangular mask in expanded coords (match original: row <= col)
+    m_tri = (o_row[:, None] <= o_col_exp[None, :]) & (m_row[:, None] & m_col_exp[None, :])
+    # BT x BTC 
+
+    # ---- gating
     if USE_G:
-        g += bos_q_o * H + i_h
-        p_g = tl.make_block_ptr(g, (T_true,), (H,), (i_tq_o * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
-
-    # if USE_G_GAMMA:
-    #     b_gamma = tl.load(g_gamma + i_h)
-    #     b_g = b_gamma * (tl.arange(0, BT) + 1)
-
-    # transpose of mask 
-    # o_t = i_tq_o * BT * num_householder + tl.arange(0, BT * num_householder)
-    # m_t = o_t < T
-    # m_A = (o_t[:, None] <= o_t[None, :]) & (m_t[:, None] & m_t)
-    # m_A_reduced = m_A[i_BT*BT:(i_BT+1)*BT, num_householder-1::num_householder]
-    
-    o_t_rows = i_tq_o * BT * num_householder + i_BT * BT + tl.arange(0, BT) # i_T * BT + tl.arange(0, BT)
-    o_t_cols = i_tq_o * BT * num_householder + (num_householder - 1) + tl.arange(0, BT) * num_householder
-    
-    m_t_rows = o_t_rows < T
-    m_t_cols = o_t_cols < T
-    m_A_reduced = (o_t_rows[:, None] <= o_t_cols[None, :]) & (m_t_rows[:, None] & m_t_cols[None, :])
-    
-    if USE_G:
-        # BT x BT 
-        # g_mask = (b_g[:, None] - b_g[None, :]) 
-        # g_mask = g_mask.repeat_interleave(num_householder, dim=1)
-        # g_mask = tl.trans(g_mask[:, i_BT*BT:(i_BT+1)*BT]) 
-
-        # TODO instead load this from memory 
-        col_idx = (i_BT * BT + tl.arange(0, BT)) // num_householder   # base column each expanded col maps to, [BT], int32
-
-        cols = tl.arange(0, BT)[:, None]                    # [BT, 1]
-        S = (cols == col_idx[None, :]).to(b_g.dtype)         # [BT, BT], bool
-
-        bg_cols = tl.sum((b_g[:, None] * S), axis=0)     # [BT]
-
-        g_mask_block = (b_g[:, None] - bg_cols[None, :])  # [BT, BT]
-        g_mask_block_T = tl.trans(g_mask_block)                               # [BT, BT]
-
-        b_A = tl.where(m_A_reduced, b_A * exp(g_mask_block_T) * scale, 0).to(do.dtype.element_ty)
+        # rows: contiguous load from expanded g
+        #  b_g[:, None] - b_g[None, :]
+        p_g_rows = tl.make_block_ptr(g, (Tloc,), (H,), (row_start,), (BT,), (0,))
+        b_g_rows = tl.load(p_g_rows, boundary_check=(0,))                 # [BT]
+        # cols: gather from expanded g at selected positions
+        b_g_cols = tl.load(g + o_col_exp * H, mask=m_col_exp, other=0.0)  # [BTC]
+        b_A = tl.where(
+            m_tri,
+            b_A * tl.exp(b_g_cols[None, :] - b_g_rows[:, None]) * scale,
+            0.0
+        ).to(do.dtype.element_ty)
     else:
-        b_A = tl.where(m_A_reduced, b_A * scale, 0).to(do.dtype.element_ty)
+        b_A = tl.where(m_tri, b_A * scale, 0.0).to(do.dtype.element_ty)
 
+    # ---- dv(expanded rows) = A [BT×BTC] @ do(TRUE) [BTC×BV]
     for i_v in range(tl.cdiv(V, BV)):
-        # p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_do = tl.make_block_ptr(do, (T_true, V), (H*V, 1), (i_tq_o * BT, i_v * BV), (BT, BV), (1, 0))
-        p_dv = tl.make_block_ptr(dv, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        b_do = tl.load(p_do, boundary_check=(0, 1))
-        b_dv = tl.dot(b_A.to(b_do.dtype), b_do)
+        p_do = tl.make_block_ptr(
+            do, (T_true, V), (H*V, 1),
+            (j0_true, i_v * BV), (BTC, BV), (1, 0)
+        )
+        b_do = tl.load(p_do, boundary_check=(0, 1))                 # [BTC,BV]
+
+        p_dv = tl.make_block_ptr(
+            dv, (Tloc, V), (H*V, 1),
+            (row_start, i_v * BV), (BT, BV), (1, 0)
+        )
+        b_dv = tl.dot(b_A.to(b_do.dtype), b_do)                     # [BT,BV]
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
+
+def chunk_gated_delta_product_bwd_dv_local(
+    q: torch.Tensor,              # [B, T_true, H, K]  (TRUE timeline)
+    k: torch.Tensor,              # [B, T_exp,  H, K]  (EXPANDED timeline)
+    do: torch.Tensor,             # [B, T_true, H, V]  (TRUE timeline)
+    g: Optional[torch.Tensor] = None,          # [B, T_exp, H] (expanded), or None
+    g_gamma: Optional[torch.Tensor] = None,    # [H], optional gamma gating
+    scale: float = None,                        # pass through; no defaulting here
+    cu_seqlens: Optional[torch.LongTensor] = None,   # expanded seqlens if varlen
+    chunk_size: int = 64,
+    num_householder: int = 1,
+) -> torch.Tensor:
+    """
+    dv for the gated delta product backward, mathematically identical to
+    running the gated-delta-net backward on q_new/do_new with chunk size
+    (chunk_size * next_power_of_2(num_householder)), but computed without
+    materializing the zero rows/cols.
+
+    Args:
+      q:  [B, T_true, H, K]  (TRUE timeline)
+      k:  [B, T_exp,  H, K]  (EXPANDED timeline)
+      do: [B, T_true, H, V]  (TRUE timeline)
+      g:  [B, T_exp,  H] (expanded) or None
+    Returns:
+      dv: [B, T_exp, H, V]   (EXPANDED timeline)
+    """
+    B, T_exp, H, K = k.shape
+    V = do.shape[-1]
+    M = num_householder
+    GRP = triton.next_power_of_2(M)
+    BT = chunk_size
+    expanded_chunk_size = BT * GRP  
+
+    # tiling for K/V
+    if check_shared_mem('hopper', k.device.index):
+        CONST_TILING = 128
+    elif check_shared_mem():
+        CONST_TILING = 64
+    else:
+        CONST_TILING = 32
+    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
+
+    # expanded-time tiles at BT granularity
+    if cu_seqlens is None:
+        NT = triton.cdiv(T_exp, BT)
+        chunk_indices = None
+    else:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        NT = len(chunk_indices)
+
+    dv = torch.empty((B, T_exp, H, V), dtype=do.dtype, device=do.device)
+
+    chunk_gated_delta_product_bwd_kernel_dv_local[(NT, B * H)](
+        q=q,
+        k=k,
+        g=g,
+        g_gamma=g_gamma,
+        do=do,
+        dv=dv,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        scale=scale,
+        T=T_exp,
+        H=H,
+        K=K,
+        V=V,
+        BT=BT,
+        BK=BK,
+        BV=BV,
+        num_householder=M,
+        expanded_chunk_size=expanded_chunk_size,
+    )
+    return dv
+
+
+
+# @triton.heuristics({
+#     'USE_G': lambda args: args['g'] is not None,
+#     'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
+#     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+# })
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+#         for num_warps in NUM_WARPS
+#         for num_stages in [2, 3, 4]
+#     ],
+#     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G'],
+# )
+# @triton.jit(do_not_specialize=['T'])
+# def chunk_gated_delta_product_bwd_kernel_dv_local(
+#     q,
+#     k,
+#     g,
+#     g_gamma,
+#     do,
+#     dv,
+#     cu_seqlens,
+#     chunk_indices,
+#     scale,
+#     T,
+#     H: tl.constexpr,
+#     K: tl.constexpr,
+#     V: tl.constexpr,
+#     BT: tl.constexpr,
+#     BK: tl.constexpr,
+#     BV: tl.constexpr,
+#     USE_G: tl.constexpr,
+#     USE_G_GAMMA: tl.constexpr,
+#     IS_VARLEN: tl.constexpr,
+#     num_householder: tl.constexpr,
+#     expanded_chunk_size: tl.constexpr,
+# ):
+#     i_t, i_bh = tl.program_id(0), tl.program_id(1)
+#     i_b, i_h = i_bh // H, i_bh % H
+#     power_of_2_num_householder = triton.next_power_of_2(num_householder) # expanded chunk is BT * power_of_2_num_householder
+
+#     if IS_VARLEN:
+#         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+#         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+#         T = eos - bos 
+
+#         bos_q_o = bos // num_householder
+#         eos_q_o = eos // num_householder
+        
+#         T_true = T // num_householder
+#     else:
+#         bos, eos = i_b * T, i_b * T + T
+#         T = T
+#         T_true = T // num_householder
+
+#         bos_q_o = bos // num_householder
+#         eos_q_o = eos // num_householder
+
+#     # i_t corresponds to BT actual tokens (0, 1, 2, 3, 4, 5, 6) num householder = 3 
+#     # i_tq corresponds to BT * num householder actual tokens 
+#     i_tq_o = i_t // power_of_2_num_householder # 0, 1, 2 should correspond to 0 and 3, 4, 5 correspond to 1 
+
+#     index_start_q_o_g = (i_tq_o * BT * power_of_2_num_householder // num_householder) 
+#     index_end_q_o_g = ((i_tq_o + 1) * BT * power_of_2_num_householder - 1)// num_householder 
+#     BT_Q_O_G = index_end_q_o_g - index_start_q_o_g + 1
+
+#     # index for which BT chunk current thread block corresponds in a block of BT * num householder chunks 
+#     i_BT = i_t % power_of_2_num_householder
+
+#     # offset calculation
+#     # q += (bos * H + i_h) * K
+#     q += (bos_q_o * H + i_h) * K
+#     k += (bos * H + i_h) * K
+#     # do += (bos * H + i_h) * V
+#     do += (bos_q_o * H + i_h) * V
+#     dv += (bos * H + i_h) * V
+
+#     b_A = tl.zeros([BT, BT], dtype=tl.float32)
+#     for i_k in range(tl.cdiv(K, BK)):
+#         p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+#         # p_q = tl.make_block_ptr(q, (K, T_true), (1, H*K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
+#         p_q = tl.make_block_ptr(q, (K, T_true), (1, H*K), (i_k * BK, i_tq_o * BT), (BK, BT), (0, 1))
+
+#         b_q = tl.load(p_q, boundary_check=(0, 1))
+#         b_k = tl.load(p_k, boundary_check=(0, 1))
+#         b_A += tl.dot(b_k, b_q)
+
+#     if USE_G:
+#         g += bos_q_o * H + i_h
+#         p_g = tl.make_block_ptr(g, (T_true,), (H,), (i_tq_o * BT,), (BT,), (0,))
+#         b_g = tl.load(p_g, boundary_check=(0,))
+
+#     # if USE_G_GAMMA:
+#     #     b_gamma = tl.load(g_gamma + i_h)
+#     #     b_g = b_gamma * (tl.arange(0, BT) + 1)
+
+#     # transpose of mask 
+#     # o_t = i_tq_o * BT * num_householder + tl.arange(0, BT * num_householder)
+#     # m_t = o_t < T
+#     # m_A = (o_t[:, None] <= o_t[None, :]) & (m_t[:, None] & m_t)
+#     # m_A_reduced = m_A[i_BT*BT:(i_BT+1)*BT, num_householder-1::num_householder]
+    
+#     o_t_rows = i_tq_o * BT * num_householder + i_BT * BT + tl.arange(0, BT) # i_T * BT + tl.arange(0, BT)
+#     o_t_cols = i_tq_o * BT * num_householder + (num_householder - 1) + tl.arange(0, BT) * num_householder
+    
+#     m_t_rows = o_t_rows < T
+#     m_t_cols = o_t_cols < T
+#     m_A_reduced = (o_t_rows[:, None] <= o_t_cols[None, :]) & (m_t_rows[:, None] & m_t_cols[None, :])
+    
+#     if USE_G:
+#         # BT x BT 
+#         # g_mask = (b_g[:, None] - b_g[None, :]) 
+#         # g_mask = g_mask.repeat_interleave(num_householder, dim=1)
+#         # g_mask = tl.trans(g_mask[:, i_BT*BT:(i_BT+1)*BT]) 
+
+#         # TODO instead load this from memory 
+#         col_idx = (i_BT * BT + tl.arange(0, BT)) // num_householder   # base column each expanded col maps to, [BT], int32
+
+#         cols = tl.arange(0, BT)[:, None]                    # [BT, 1]
+#         S = (cols == col_idx[None, :]).to(b_g.dtype)         # [BT, BT], bool
+
+#         bg_cols = tl.sum((b_g[:, None] * S), axis=0)     # [BT]
+
+#         g_mask_block = (b_g[:, None] - bg_cols[None, :])  # [BT, BT]
+#         g_mask_block_T = tl.trans(g_mask_block)                               # [BT, BT]
+
+#         b_A = tl.where(m_A_reduced, b_A * exp(g_mask_block_T) * scale, 0).to(do.dtype.element_ty)
+#     else:
+#         b_A = tl.where(m_A_reduced, b_A * scale, 0).to(do.dtype.element_ty)
+
+#     for i_v in range(tl.cdiv(V, BV)):
+#         # p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+#         p_do = tl.make_block_ptr(do, (T_true, V), (H*V, 1), (i_tq_o * BT, i_v * BV), (BT, BV), (1, 0))
+#         p_dv = tl.make_block_ptr(dv, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+#         b_do = tl.load(p_do, boundary_check=(0, 1))
+#         b_dv = tl.dot(b_A.to(b_do.dtype), b_do)
+#         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
+
+
+# def chunk_gated_delta_product_bwd_dv_local(
+#     q: torch.Tensor,
+#     k: torch.Tensor,
+#     do: torch.Tensor,
+#     g: Optional[torch.Tensor] = None,
+#     g_gamma: Optional[torch.Tensor] = None,
+#     scale: float = None,
+#     cu_seqlens: Optional[torch.LongTensor] = None,
+#     chunk_size: int = 64,
+#     num_householder: int = 1,
+# ) -> torch.Tensor:
+#     B, T, H, K, V = *k.shape, do.shape[-1]
+#     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+#     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+#     expanded_chunk_size = chunk_size * triton.next_power_of_2(num_householder)
+#     # H100 can have larger block size
+#     if check_shared_mem('hopper', k.device.index):
+#         CONST_TILING = 128
+#     elif check_shared_mem:
+#         CONST_TILING = 64
+#     else:
+#         CONST_TILING = 32
+#     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
+#     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
+#     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+#     dv = torch.empty((B, T, H, V), dtype=do.dtype, device=do.device)
+#     grid = (NT, B * H)
+#     chunk_gated_delta_product_bwd_kernel_dv_local[grid](
+#         q=q,
+#         k=k,
+#         g=g,
+#         g_gamma=g_gamma,
+#         do=do,
+#         dv=dv,
+#         cu_seqlens=cu_seqlens,
+#         chunk_indices=chunk_indices,
+#         scale=scale,
+#         T=T,
+#         H=H,
+#         K=K,
+#         V=V,
+#         BT=BT,
+#         BK=BK,
+#         BV=BV,
+#         num_householder=num_householder,
+#     )
+#     return dv
+    
 
 # @triton.heuristics({
 #     'USE_G': lambda args: args['g'] is not None,
@@ -922,3 +1148,283 @@ def chunk_bwd_dqkwg(
     if dg is not None:
         dg = dg.sum(0)
     return dq, dk, dw, dg
+
+@triton.heuristics({
+    'USE_G':        lambda args: args['g'] is not None,
+    'USE_G_GAMMA':  lambda args: args['g_gamma'] is not None,
+    'USE_DW':       lambda args: args['dw'] is not None,
+    'IS_VARLEN':    lambda args: args['cu_seqlens'] is not None,
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in NUM_WARPS
+        for num_stages in [2, 3, 4]
+    ],
+    key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G', 'USE_G_GAMMA', 'USE_DW'],
+)
+@triton.jit(do_not_specialize=['T'])
+def chunk_bwd_kernel_dqkwg(
+    q,              # [B, T_true, H, K] (TRUE timeline)
+    k,              # [B, T_exp,  H, K] (EXPANDED timeline)
+    v,              # [B, T_exp,  H, V] (EXPANDED)
+    h,              # [B, NTG,    H, V, K] (only if USE_DW)
+    g,              # [B, T_exp,  H] (EXPANDED, log-space), optional
+    g_gamma,        # unused here
+    do,             # [B, T_true, H, V] (TRUE)
+    dh,             # unused here (kept for signature parity)
+    dq,             # [B, T_true, H, K] (TRUE)  OUT
+    dk,             # [B, T_exp,  H, K] (EXPANDED) OUT
+    dg,             # not written in this kernel
+    w,              # [B, T_exp,  H, K] (EXPANDED), optional (for dw)
+    dv,             # [B, T_exp,  H, V] (EXPANDED), optional (for dw)
+    dw,             # [B, T_exp,  H, K] (EXPANDED) OUT if USE_DW
+    cu_seqlens,     # [B+1] expanded lengths or None
+    chunk_indices,  # not used here (kept for API parity)
+    scale,          # float
+    B: tl.constexpr,
+    T,              # expanded length per sequence if fixed-length
+    num_householder: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,      # base tile along EXPANDED axis; group size uses GRP
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_G: tl.constexpr,
+    USE_G_GAMMA: tl.constexpr,
+    USE_DW: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    NTG: tl.constexpr,     # max number of expanded-chunk groups per sequence (passed from host)
+):
+    # --- program ids ---
+    i_kblk, i_grp, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    # --- geometry ---
+    M   = num_householder
+    GRP = triton.next_power_of_2(M)
+    EXP_CHUNK: tl.constexpr = BT * GRP
+    BTC: tl.constexpr = (EXP_CHUNK + M - 1) // M  # ceil(EXP_CHUNK / M)
+
+    # --- sequence bounds (expanded) ---
+    if IS_VARLEN:
+        bos_e = tl.load(cu_seqlens + i_b).to(tl.int32)
+        eos_e = tl.load(cu_seqlens + i_b + 1).to(tl.int32)
+        Tloc_e = eos_e - bos_e
+        NT_grp = tl.cdiv(Tloc_e, EXP_CHUNK)
+        chunk_lo = i_grp * EXP_CHUNK
+        chunk_hi = tl.minimum(chunk_lo + EXP_CHUNK, Tloc_e)
+    else:
+        bos_e = i_b * T
+        Tloc_e = T
+        NT_grp = tl.cdiv(Tloc_e, EXP_CHUNK)
+        chunk_lo = i_grp * EXP_CHUNK
+        chunk_hi = tl.minimum(chunk_lo + EXP_CHUNK, Tloc_e)
+
+    # --- TRUE length (assumed exact expansion) ---
+    Tloc_t = Tloc_e // M
+
+    # --- base offsets per (batch, head) ---
+    # TRUE tensors
+    q  += (((bos_e // M) * H + i_h) * K)
+    do += (((bos_e // M) * H + i_h) * V)
+    dq += (((bos_e // M) * H + i_h) * K)
+    # EXPANDED tensors
+    k  += ((bos_e * H + i_h) * K)
+    v  += ((bos_e * H + i_h) * V)
+    dk += ((bos_e * H + i_h) * K)
+    if USE_DW:
+        w  += ((bos_e * H + i_h) * K)
+        dv += ((bos_e * H + i_h) * V)
+        dw += ((bos_e * H + i_h) * K)
+        # h is [B, NTG, H, V, K]; slab size V*K with K contiguous
+        h += (((i_b * NTG + i_grp) * H + i_h) * (V * K))
+    if USE_G:
+        g  += ((bos_e * H + i_h))
+
+    # strides
+    stride_true_k = H * K
+    stride_true_v = H * V
+    stride_exp_k  = H * K
+    stride_exp_v  = H * V
+
+    # -------------------------------------------------
+    # TRUE columns covered by this expanded-chunk group
+    # -------------------------------------------------
+    j0_true   = chunk_lo // M
+    j_rel     = tl.arange(0, BTC)
+    o_col_exp = chunk_lo + (M - 1) + j_rel * M
+    m_cols_e  = o_col_exp < chunk_hi
+    m_cols_t  = (j0_true + j_rel) < Tloc_t
+    m_cols    = m_cols_e & m_cols_t
+    has_cols  = tl.any(m_cols)
+
+    # Load Q slab only if there are owned TRUE columns
+    if has_cols:
+        p_q = tl.make_block_ptr(q, (K, Tloc_t), (1, stride_true_k),
+                                (i_kblk * BK, j0_true), (BK, BTC), (0, 1))
+        b_q = tl.load(p_q, boundary_check=(0, 1))            # [BK, BTC]
+        b_q = tl.where(m_cols[None, :], b_q, 0.0)
+    else:
+        b_q = tl.zeros([BK, BTC], dtype=tl.float32)
+
+    # Accumulator for dQ on this (K-slab × BTC cols)
+    b_dq_cols = tl.zeros([BK, BTC], dtype=tl.float32)
+
+    # --------------------------------
+    # Iterate expanded row tiles in this group
+    # --------------------------------
+    for i_rt in range(GRP):
+        tile_row_base = chunk_lo + i_rt * BT
+        o_rows = tile_row_base + tl.arange(0, BT)
+        m_rows = o_rows < chunk_hi
+        if not tl.any(m_rows):
+            continue
+
+        # Load K rows (BT × BK)
+        p_k = tl.make_block_ptr(k, (Tloc_e, K), (stride_exp_k, 1),
+                                (tile_row_base, i_kblk * BK), (BT, BK), (1, 0))
+        b_k = tl.load(p_k, boundary_check=(0, 1))          # [BT, BK]
+
+        # dA^T accumulator for this row-tile (BT × BTC)
+        b_dA_T = tl.zeros([BT, BTC], dtype=tl.float32)
+
+        # dW accumulation per row-tile (across all BV tiles) if enabled
+        if USE_DW:
+            b_dw_tile = tl.zeros([BT, BK], dtype=tl.float32)
+
+        # Accumulate over V tiles
+        for i_vblk in range(tl.cdiv(V, BV)):
+            # V rows (BT × BV)
+            p_v = tl.make_block_ptr(v, (Tloc_e, V), (stride_exp_v, 1),
+                                    (tile_row_base, i_vblk * BV), (BT, BV), (1, 0))
+            b_v = tl.load(p_v, boundary_check=(0, 1))      # [BT, BV]
+
+            if has_cols:
+                # dO (BTC × BV) on TRUE timeline
+                p_do = tl.make_block_ptr(do, (Tloc_t, V), (stride_true_v, 1),
+                                         (j0_true, i_vblk * BV), (BTC, BV), (1, 0))
+                b_do = tl.load(p_do, boundary_check=(0, 1))    # [BTC, BV]
+                b_do = tl.where(m_cols[:, None], b_do, 0.0)
+                # dA_up^T contribution: [BT,BV] @ [BV,BTC]
+                b_dA_T += tl.dot(b_v, tl.trans(b_do))
+
+            if USE_DW:
+                # dW += dV @ h^T  (independent of TRUE cols)
+                p_dv = tl.make_block_ptr(dv, (Tloc_e, V), (stride_exp_v, 1),
+                                         (tile_row_base, i_vblk * BV), (BT, BV), (1, 0))
+                b_dv = tl.load(p_dv, boundary_check=(0, 1))               # [BT, BV]
+                p_h  = tl.make_block_ptr(h, (V, K), (K, 1),
+                                         (i_vblk * BV, i_kblk * BK), (BV, BK), (0, 1))
+                b_h  = tl.load(p_h, boundary_check=(0, 1))                # [BV, BK]
+                b_dw_tile += tl.dot(b_dv.to(b_h.dtype), b_h.to(b_h.dtype)) # [BT, BK]
+
+        if has_cols:
+            # Gating and scaling for rows/cols in this tile
+            if USE_G:
+                # row gates (expanded)
+                p_gr = tl.make_block_ptr(g, (Tloc_e,), (H,), (tile_row_base,), (BT,), (0,))
+                b_gr = tl.load(p_gr, boundary_check=(0,))                  # [BT]
+                # column gates (expanded reps for TRUE columns)
+                b_gc = tl.load(g + o_col_exp * H, mask=m_cols, other=0.0)  # [BTC]
+                gate = tl.exp(b_gc[None, :] - b_gr[:, None])               # [BT,BTC]
+                b_dA_T = b_dA_T * gate * scale
+            else:
+                b_dA_T = b_dA_T * scale
+
+            # causal mask (expanded): row >= col
+            m_tri = (o_rows[:, None] >= o_col_exp[None, :])
+            m_rc  = (m_rows[:, None] & m_cols[None, :])
+            b_dA_T = tl.where(m_tri & m_rc, b_dA_T, 0.0)
+
+            # dQ contribution:  K^T @ dA_T
+            b_dq_cols += tl.dot(tl.trans(b_k), b_dA_T.to(b_k.dtype))
+
+            # dK tile = dA_T @ Q^T
+            b_dk_tile = tl.dot(b_dA_T.to(b_q.dtype), tl.trans(b_q))  # [BT,BK]
+        else:
+            # No TRUE columns => dK for these rows is zero
+            b_dk_tile = tl.zeros([BT, BK], dtype=tl.float32)
+
+        # Store dk (masked by active rows)
+        p_dk = tl.make_block_ptr(dk, (Tloc_e, K), (stride_exp_k, 1),
+                                 (tile_row_base, i_kblk * BK), (BT, BK), (1, 0))
+        tl.store(p_dk, b_dk_tile.to(p_dk.dtype.element_ty),
+                 mask=m_rows[:, None], boundary_check=(0, 1))
+
+        # store dW once per row-tile after accumulating all BV tiles
+        if USE_DW:
+            p_dw = tl.make_block_ptr(dw, (Tloc_e, K), (stride_exp_k, 1),
+                                     (tile_row_base, i_kblk * BK), (BT, BK), (1, 0))
+            tl.store(p_dw, (-b_dw_tile).to(p_dw.dtype.element_ty),
+                     mask=m_rows[:, None], boundary_check=(0, 1))
+
+    # Final masked store for dQ over TRUE columns owned by this group
+    if has_cols:
+        p_dq_cols = tl.make_block_ptr(
+            dq, (Tloc_t, K), (stride_true_k, 1),
+            (j0_true, i_kblk * BK), (BTC, BK), (1, 0)
+        )
+        dq_tile = tl.trans(b_dq_cols).to(p_dq_cols.dtype.element_ty)  # [BTC,BK]
+        tl.store(p_dq_cols, dq_tile, mask=m_cols[:, None], boundary_check=(0, 1))
+
+
+# -------------------------
+# Python launcher
+# -------------------------
+def chunk_bwd_dqkwg(
+    q: torch.Tensor,           # [B, T_true, H, K]  (TRUE)
+    k: torch.Tensor,           # [B, T_exp,  H, K]  (EXPANDED)
+    v: torch.Tensor,           # [B, T_exp,  H, V]
+    do: torch.Tensor,          # [B, T_true, H, V]
+    h: torch.Tensor = None,    # used only if USE_DW; expected [B, NTG, H, V, K]
+    dh: torch.Tensor = None,   # unused here (kept for API parity)
+    g: torch.Tensor = None,    # [B, T_exp, H] or None
+    g_gamma: torch.Tensor = None,
+    dv: torch.Tensor = None,   # [B, T_exp, H, V] if computing dw
+    w: torch.Tensor = None,    # [B, T_exp, H, K] if computing dw
+    cu_seqlens: torch.LongTensor = None,  # expanded lengths or None
+    chunk_size: int = 64,
+    scale: float = 1.0,
+    num_householder: int = 1,
+):
+    B, T_true, H, K = q.shape
+    V = do.shape[-1]
+    T_exp = k.shape[1]
+    M = num_householder
+    assert T_exp == T_true * M, f"Expanded length mismatch: T_exp={T_exp}, T_true*M={T_true*M}"
+
+    # tiling
+    BT = chunk_size
+    GRP = triton.next_power_of_2(M)
+    EXP_CHUNK = BT * GRP
+    CONST_TILING = 64 if check_shared_mem() else 32
+    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
+    NK = triton.cdiv(K, BK)
+
+    chunk_indices = prepare_chunk_indices(cu_seqlens, EXP_CHUNK) if cu_seqlens is not None else None
+    NTG = triton.cdiv(T_exp, EXP_CHUNK) if cu_seqlens is None else len(chunk_indices)
+
+    grid = (NK, NTG, B * H)
+
+    dq_out = torch.empty_like(q)
+    dk_out = torch.empty_like(k)
+    dw_out = torch.empty_like(w) if w is not None else None
+
+    chunk_bwd_kernel_dqkwg[grid](
+        q=q, k=k, v=v,
+        h=h,
+        g=g, g_gamma=g_gamma, do=do, dh=dh,
+        dq=dq_out, dk=dk_out, dg=dg_out,
+        w=w,
+        dv=dv,
+        dw=dw_out,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        scale=scale, B=B, T=T_exp, num_householder=M, H=H, K=K, V=V,
+        BT=BT, BK=BK, BV=BV,
+        NTG=NTG,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return dq_out, dk_out, dw_out
