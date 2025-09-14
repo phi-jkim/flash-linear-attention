@@ -177,7 +177,9 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64_expanded(
             b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
             p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
-            b_v_new = b_v_new * tl.where(m_t, tl.exp(b_g_last - b_g), 0)[:, None]
+            # cast to accumulator dtype; use 0.0 (float) not 0 (int)
+            gate = tl.exp((b_g_last - b_g).to(b_v_new.dtype))
+            b_v_new = b_v_new * tl.where(m_t, gate, 0.0)[:, None]
             s = tl.exp(b_g_last)
             if (i_t % GRP) == 0:
                 b_h1 = b_h1 * s
@@ -412,7 +414,8 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
             b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
             p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
-            b_v_new = b_v_new * tl.where(m_t, tl.exp(b_g_last - b_g), 0)[:, None]
+            gate = tl.exp((b_g_last - b_g).to(b_v_new.dtype))
+            b_v_new = b_v_new * tl.where(m_t, gate, 0.0)[:, None]
             s = tl.exp(b_g_last)
             b_h1 = b_h1 * s
             if K > 64:
@@ -548,14 +551,17 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
     USE_INITIAL_STATE: tl.constexpr,
     USE_FINAL_STATE_GRADIENT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    BTC: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
 
-    M   = num_householder
-    EXP_CHUNK = expanded_chunk_size
-    GRP = EXP_CHUNK // BT
-    BTC = (expanded_chunk_size + M - 1) // M  # ceil(EXP_CHUNK / M)
+    # ensure these are compile-time constants for arange
+    M: tl.constexpr = num_householder
+    EXP_CHUNK: tl.constexpr = expanded_chunk_size
+    GRP: tl.constexpr = EXP_CHUNK // BT
+    # BTC: tl.constexpr = (EXP_CHUNK + M - 1) // M  # ceil(EXP_CHUNK / M)
+    # In Python code before kernel launch
 
     # expanded bounds
     if IS_VARLEN:
@@ -651,9 +657,11 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
         last_idx = chunk_hi - 1
 
         # 2) GROUP ENTRY (first tile from the right)
-        is_group_entry = (i_t == (grp_hi_tiles - 1)) or (i_t == (NT - 1))
+        # TODO check, why not just do is_group_entry is_boundary 
+        # is_group_entry = (i_t == (grp_hi_tiles - 1)) or (i_t == (NT - 1))
+        is_group_entry = is_boundary
         if USE_G:
-            bg_last = tl.load(g + last_idx * H)
+            bg_last = tl.load(g + last_idx * H)  # g already advanced to i_h
             if is_group_entry:
                 # capture PRE snapshot
                 b_dh1_pre = b_dh1
@@ -694,7 +702,8 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
 
         if USE_G:
             m_rows = (tile_row_base + tl.arange(0, BT)) < Tloc
-            b_dv *= tl.where(m_rows, tl.exp(bg_last - b_g_rows), 0)[:, None]
+            gate_rows = tl.exp((bg_last - b_g_rows).to(b_dv.dtype))
+            b_dv *= tl.where(m_rows, gate_rows, 0.0)[:, None]
 
         p_dv  = tl.make_block_ptr(dv,  (Tloc, V), (stride_v, 1), (tile_row_base, i_v * BV), (BT, BV), (1, 0))
         p_dv2 = tl.make_block_ptr(dv2, (Tloc, V), (stride_v, 1), (tile_row_base, i_v * BV), (BT, BV), (1, 0))
@@ -703,7 +712,7 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
 
         # 4) dh update inside the group: restrict TRUE columns to this expanded group
         j0_true = chunk_lo // M
-        o_col_exp = chunk_lo + (M - 1) + tl.arange(0, BTC) * M
+        o_col_exp = chunk_lo + (M - 1) + tl.arange(0, ) * M
         m_cols = (o_col_exp < chunk_hi) & ((j0_true + tl.arange(0, BTC)) < T_true)
 
         if is_group_entry:
@@ -812,6 +821,7 @@ def chunk_gated_delta_product_bwd_dhu(
     BT = chunk_size
     GRP = triton.next_power_of_2(num_householder)  # expanded-chunk grouping
     EXP_CHUNK = BT * GRP
+    BTC = (EXP_CHUNK + num_householder - 1) // num_householder
 
     assert K <= 256, "current kernel does not support head dimension being larger than 256."
 
@@ -853,6 +863,6 @@ def chunk_gated_delta_product_bwd_dhu(
         T_true=T_true,
         num_householder=num_householder,
         expanded_chunk_size=EXP_CHUNK,
-        H=H, K=K, V=V, BT=BT,
+        H=H, K=K, V=V, BT=BT, BTC=BTC,
     )
     return dh, dh0_out, dv2

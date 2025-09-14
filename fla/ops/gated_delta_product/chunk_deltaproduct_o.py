@@ -397,6 +397,7 @@ def chunk_bwd_kernel_dqkwg(
     IS_VARLEN: tl.constexpr,
     NTG: tl.constexpr,     # number of expanded-chunk groups per sequence
     expanded_chunk_size: tl.constexpr,  # == BT * next_power_of_2(num_householder)
+    BTC: tl.constexpr,
 ):
     # program ids
     i_kblk, i_grp, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -406,7 +407,9 @@ def chunk_bwd_kernel_dqkwg(
     M   = num_householder
     EXP_CHUNK = expanded_chunk_size
     GRP = EXP_CHUNK // BT
-    BTC = (EXP_CHUNK + M - 1) // M  # ceil(EXP_CHUNK / M)
+    # BTC = (EXP_CHUNK + M - 1) // M  # ceil(EXP_CHUNK / M)
+    # In Python code before kernel launch
+    # BTC = (expanded_chunk_size + num_householder - 1) // num_householder
 
     # sequence bounds (expanded)
     if IS_VARLEN:
@@ -584,6 +587,7 @@ def chunk_bwd_dqkwg(
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NK = triton.cdiv(K, BK)
+    BTC = (EXP_CHUNK + M - 1) // M
 
     # expanded grouping
     if cu_seqlens is None:
@@ -614,5 +618,6 @@ def chunk_bwd_dqkwg(
         BT=BT, BK=BK, BV=BV,
         NTG=NTG,
         expanded_chunk_size=EXP_CHUNK,
+        BTC=BTC,
     )
     return dq_out, dk_out, dw_out
