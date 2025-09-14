@@ -94,6 +94,7 @@ def chunk_fwd_kernel_o(
         g += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))            # [BT]
+        # causal mask (lower-triangular in true time)
         m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
         b_m = tl.where(m_A, tl.exp(b_g[:, None] - b_g[None, :]), 0.0)
         b_o = b_o * tl.exp(b_g)[:, None]
@@ -105,15 +106,27 @@ def chunk_fwd_kernel_o(
         b_A = tl.zeros([BT, BT], dtype=tl.float32)
         for i_k in range(tl.cdiv(K, BK)):
             p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-            p_k = tl.make_block_ptr(k + i_dp * H * K, (K, T), (1, num_householder * H * K),
-                                     (i_k * BK, i_t * BT), (BK, BT), (0, 1))
+            p_k = tl.make_block_ptr(
+                k + i_dp * H * K,
+                (K, T),
+                (1, num_householder * H * K),
+                (i_k * BK, i_t * BT),
+                (BK, BT),
+                (0, 1),
+            )
             b_q = tl.load(p_q, boundary_check=(0, 1))
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_A += tl.dot(b_q, b_k)
         b_A = b_A * b_m
 
-        p_v = tl.make_block_ptr(v + i_dp * H * V, (T, V), (H * V * num_householder, 1),
-                                 (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_v = tl.make_block_ptr(
+            v + i_dp * H * V,
+            (T, V),
+            (H * V * num_householder, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_o += tl.dot(b_A.to(b_v.dtype), b_v)
 
@@ -145,11 +158,11 @@ def chunk_gated_delta_product_fwd_o(
 
     B, T_true, H, K = q.shape
     V = v.shape[-1]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T_true)))
+    BT = chunk_size
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T_true, BT) if cu_seqlens is None else len(chunk_indices)
 
-    o = v.new_empty(B, T_true, H, V).fill_(-float('inf'))
+    o = v.new_empty(B, T_true, H, V)
 
     def grid(meta):
         return (triton.cdiv(V, meta['BV']), NT, B * H)
@@ -260,15 +273,14 @@ def chunk_gated_delta_product_bwd_kernel_dv_local(
     # causal mask in expanded coords (row <= col)
     m_tri = (o_row[:, None] <= o_col_exp[None, :]) & (m_row[:, None] & m_col_exp[None, :])
 
-    # gating
+    # gating (keep float32; cast right before dot with b_do)
     if USE_G:
         p_g_rows = tl.make_block_ptr(g, (Tloc,), (H,), (row_start,), (BT,), (0,))
         b_g_rows = tl.load(p_g_rows, boundary_check=(0,))                  # [BT]
         b_g_cols = tl.load(g + o_col_exp * H, mask=m_col_exp, other=0.0)   # [BTC]
         b_A = tl.where(m_tri, b_A * tl.exp(b_g_cols[None, :] - b_g_rows[:, None]) * scale, 0.0)
-        b_A = b_A.to(do.dtype.element_ty)
     else:
-        b_A = tl.where(m_tri, b_A * scale, 0.0).to(do.dtype.element_ty)
+        b_A = tl.where(m_tri, b_A * scale, 0.0)
 
     # dv(expanded rows) = A [BT×BTC] @ do(TRUE) [BTC×BV]
     for i_v in range(tl.cdiv(V, BV)):
@@ -307,7 +319,7 @@ def chunk_gated_delta_product_bwd_dv_local(
     BTC = (expanded_chunk_size + M - 1) // M  # ceil(expanded_chunk_size / M)
 
     # tiling for K/V
-    if check_shared_mem('hopper', k.device.index):
+    if is_nvidia_hopper:
         CONST_TILING = 128
     elif check_shared_mem():
         CONST_TILING = 64
@@ -384,6 +396,7 @@ def chunk_bwd_kernel_dqkwg(
     USE_DW: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NTG: tl.constexpr,     # number of expanded-chunk groups per sequence
+    expanded_chunk_size: tl.constexpr,  # == BT * next_power_of_2(num_householder)
 ):
     # program ids
     i_kblk, i_grp, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -391,9 +404,9 @@ def chunk_bwd_kernel_dqkwg(
 
     # geometry
     M   = num_householder
-    GRP = triton.next_power_of_2(M)
-    EXP_CHUNK: tl.constexpr = BT * GRP
-    BTC: tl.constexpr = (EXP_CHUNK + M - 1) // M  # ceil(EXP_CHUNK / M)
+    EXP_CHUNK = expanded_chunk_size
+    GRP = EXP_CHUNK // BT
+    BTC = (EXP_CHUNK + M - 1) // M  # ceil(EXP_CHUNK / M)
 
     # sequence bounds (expanded)
     if IS_VARLEN:
@@ -426,7 +439,7 @@ def chunk_bwd_kernel_dqkwg(
         w  += ((bos_e * H + i_h) * K)
         dv += ((bos_e * H + i_h) * V)
         dw += ((bos_e * H + i_h) * K)
-        # h slab per (batch, group, head)
+        # h slab per (batch, group, head) with layout [V, K]
         h  += (((i_b * NTG + i_grp) * H + i_h) * (V * K))
     if USE_G:
         g  += ((bos_e * H + i_h))
@@ -444,16 +457,12 @@ def chunk_bwd_kernel_dqkwg(
     m_cols_e  = o_col_exp < chunk_hi
     m_cols_t  = (j0_true + j_rel) < Tloc_t
     m_cols    = m_cols_e & m_cols_t
-    has_cols  = tl.any(m_cols)
 
-    # Load Q slab only if we own TRUE columns
-    if has_cols:
-        p_q = tl.make_block_ptr(q, (K, Tloc_t), (1, stride_true_k),
-                                (i_kblk * BK, j0_true), (BK, BTC), (0, 1))
-        b_q = tl.load(p_q, boundary_check=(0, 1))            # [BK, BTC]
-        b_q = tl.where(m_cols[None, :], b_q, 0.0)
-    else:
-        b_q = tl.zeros([BK, BTC], dtype=tl.float32)
+    # Load Q slab and mask columns
+    p_q = tl.make_block_ptr(q, (K, Tloc_t), (1, stride_true_k),
+                            (i_kblk * BK, j0_true), (BK, BTC), (0, 1))
+    b_q = tl.load(p_q, boundary_check=(0, 1))            # [BK, BTC]
+    b_q = tl.where(m_cols[None, :], b_q, 0.0)
 
     b_dq_cols = tl.zeros([BK, BTC], dtype=tl.float32)
 
@@ -462,8 +471,6 @@ def chunk_bwd_kernel_dqkwg(
         tile_row_base = chunk_lo + i_rt * BT
         o_rows = tile_row_base + tl.arange(0, BT)
         m_rows = o_rows < chunk_hi
-        if not tl.any(m_rows):
-            continue
 
         # K rows (BT × BK)
         p_k = tl.make_block_ptr(k, (Tloc_e, K), (stride_exp_k, 1),
@@ -483,12 +490,11 @@ def chunk_bwd_kernel_dqkwg(
                                     (tile_row_base, i_vblk * BV), (BT, BV), (1, 0))
             b_v = tl.load(p_v, boundary_check=(0, 1))      # [BT, BV]
 
-            if has_cols:
-                p_do = tl.make_block_ptr(do, (Tloc_t, V), (stride_true_v, 1),
-                                         (j0_true, i_vblk * BV), (BTC, BV), (1, 0))
-                b_do = tl.load(p_do, boundary_check=(0, 1))    # [BTC, BV]
-                b_do = tl.where(m_cols[:, None], b_do, 0.0)
-                b_dA_T += tl.dot(b_v, tl.trans(b_do))          # [BT, BTC]
+            p_do = tl.make_block_ptr(do, (Tloc_t, V), (stride_true_v, 1),
+                                     (j0_true, i_vblk * BV), (BTC, BV), (1, 0))
+            b_do = tl.load(p_do, boundary_check=(0, 1))    # [BTC, BV]
+            b_do = tl.where(m_cols[:, None], b_do, 0.0)
+            b_dA_T += tl.dot(b_v, tl.trans(b_do))          # [BT, BTC]
 
             if USE_DW:
                 p_dv = tl.make_block_ptr(dv, (Tloc_e, V), (stride_exp_v, 1),
@@ -499,29 +505,26 @@ def chunk_bwd_kernel_dqkwg(
                 b_h  = tl.load(p_h, boundary_check=(0, 1))                # [BV, BK]
                 b_dw_tile += tl.dot(b_dv.to(b_h.dtype), b_h.to(b_h.dtype)) # [BT, BK]
 
-        if has_cols:
-            # gating & scaling
-            if USE_G:
-                p_gr = tl.make_block_ptr(g, (Tloc_e,), (H,), (tile_row_base,), (BT,), (0,))
-                b_gr = tl.load(p_gr, boundary_check=(0,))                  # [BT]
-                b_gc = tl.load(g + o_col_exp * H, mask=m_cols, other=0.0)  # [BTC]
-                gate = tl.exp(b_gc[None, :] - b_gr[:, None])               # [BT,BTC]
-                b_dA_T = b_dA_T * gate * scale
-            else:
-                b_dA_T = b_dA_T * scale
-
-            # causal mask (expanded): row >= col
-            m_tri = (o_rows[:, None] >= o_col_exp[None, :])
-            m_rc  = (m_rows[:, None] & m_cols[None, :])
-            b_dA_T = tl.where(m_tri & m_rc, b_dA_T, 0.0)
-
-            # dQ contribution:  K^T @ dA_T
-            b_dq_cols += tl.dot(tl.trans(b_k), b_dA_T.to(b_k.dtype))
-
-            # dK tile = dA_T @ Q^T
-            b_dk_tile = tl.dot(b_dA_T.to(b_q.dtype), tl.trans(b_q))  # [BT, BK]
+        # gating & scaling
+        if USE_G:
+            p_gr = tl.make_block_ptr(g, (Tloc_e,), (H,), (tile_row_base,), (BT,), (0,))
+            b_gr = tl.load(p_gr, boundary_check=(0,))                  # [BT]
+            b_gc = tl.load(g + o_col_exp * H, mask=m_cols, other=0.0)  # [BTC]
+            gate = tl.exp(b_gc[None, :] - b_gr[:, None])               # [BT,BTC]
+            b_dA_T = b_dA_T * gate * scale
         else:
-            b_dk_tile = tl.zeros([BT, BK], dtype=tl.float32)
+            b_dA_T = b_dA_T * scale
+
+        # causal mask (expanded): row >= col and valid (rows/cols)
+        m_tri = (o_rows[:, None] >= o_col_exp[None, :])
+        m_rc  = (m_rows[:, None] & m_cols[None, :])
+        b_dA_T = tl.where(m_tri & m_rc, b_dA_T, 0.0)
+
+        # dQ contribution:  K^T @ dA_T
+        b_dq_cols += tl.dot(tl.trans(b_k), b_dA_T.to(b_k.dtype))
+
+        # dK tile = dA_T @ Q^T
+        b_dk_tile = tl.dot(b_dA_T.to(b_q.dtype), tl.trans(b_q))  # [BT, BK]
 
         # store dk (masked by active rows)
         p_dk = tl.make_block_ptr(dk, (Tloc_e, K), (stride_exp_k, 1),
@@ -536,13 +539,12 @@ def chunk_bwd_kernel_dqkwg(
                      mask=m_rows[:, None], boundary_check=(0, 1))
 
     # final masked store for dQ over TRUE columns owned by this group
-    if has_cols:
-        p_dq_cols = tl.make_block_ptr(
-            dq, (Tloc_t, K), (stride_true_k, 1),
-            (j0_true, i_kblk * BK), (BTC, BK), (1, 0)
-        )
-        dq_tile = tl.trans(b_dq_cols).to(p_dq_cols.dtype.element_ty)  # [BTC,BK]
-        tl.store(p_dq_cols, dq_tile, mask=m_cols[:, None], boundary_check=(0, 1))
+    p_dq_cols = tl.make_block_ptr(
+        dq, (Tloc_t, K), (stride_true_k, 1),
+        (j0_true, i_kblk * BK), (BTC, BK), (1, 0)
+    )
+    dq_tile = tl.trans(b_dq_cols).to(p_dq_cols.dtype.element_ty)  # [BTC,BK]
+    tl.store(p_dq_cols, dq_tile, mask=m_cols[:, None], boundary_check=(0, 1))
 
 
 def chunk_bwd_dqkwg(
@@ -585,12 +587,10 @@ def chunk_bwd_dqkwg(
 
     # expanded grouping
     if cu_seqlens is None:
-        chunk_indices = None
         NTG = triton.cdiv(T_exp, EXP_CHUNK)
     else:
-        # cu_seqlens is expected to be EXPANDED lengths
-        chunk_indices = prepare_chunk_indices(cu_seqlens, EXP_CHUNK)
-        NTG = len(chunk_indices)
+        # Use the padded-expanded length to derive a safe upper bound of groups
+        NTG = triton.cdiv(int(cu_seqlens[-1].item() - cu_seqlens[-2].item() if len(cu_seqlens) > 1 else cu_seqlens[-1].item()), EXP_CHUNK)  # conservative
 
     grid = (NK, NTG, B * H)
 
@@ -609,9 +609,10 @@ def chunk_bwd_dqkwg(
         w=(w if compute_dw else None),
         dv=(dv if compute_dw else None),
         dw=dw_out,
-        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        cu_seqlens=cu_seqlens, chunk_indices=None,
         scale=scale, B=B, T=T_exp, num_householder=M, H=H, K=K, V=V,
         BT=BT, BK=BK, BV=BV,
         NTG=NTG,
+        expanded_chunk_size=EXP_CHUNK,
     )
     return dq_out, dk_out, dw_out
