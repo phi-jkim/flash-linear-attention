@@ -3,6 +3,7 @@
 
 from typing import Optional
 
+from fla.ops.abc import chunk
 from fla.ops.gated_delta_product.wy_fast import prepare_wy_repr_bwd_expanded, recompute_w_u_expanded
 import torch
 import triton
@@ -10,7 +11,7 @@ from einops import rearrange
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from fla.ops.delta_rule.wy_fast import recompute_w_u_fwd as dn_recompute_w_u_fwd
-from fla.ops.gated_delta_product.chunk_deltaproduct_h import chunk_gated_delta_product_fwd_h, chunk_gated_delta_product_fwd_h_version_2
+from fla.ops.gated_delta_product.chunk_deltaproduct_h import chunk_gated_delta_product_fwd_h
 from fla.ops.gated_delta_product.chunk_deltaproduct_o import chunk_gated_delta_product_fwd_o
 from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd as gdn_recompute_w_u_fwd
 from fla.ops.utils import chunk_local_cumsum, solve_tril
@@ -31,7 +32,7 @@ def chunk_gated_delta_product_fwd(
 ):
     cu_seqlens_dp = cu_seqlens * num_householder if cu_seqlens is not None else None
     # next power of 2 of num_householder * BT 
-    chunk_size = 64 
+    chunk_size = 64
     expanded_chunk_size = chunk_size * triton.next_power_of_2(num_householder)
     if g is not None:
         g_interleaved = g.new_zeros(g.shape[0], g.shape[1], num_householder, g.shape[2], dtype=torch.float32)
@@ -114,7 +115,7 @@ def chunk_gated_delta_product_bwd(
     initial_state: Optional[torch.Tensor] = None,
     num_householder: int = 1,
 ):
-    chunk_size = 64 
+    chunk_size = 64
     expanded_chunk_size = chunk_size * triton.next_power_of_2(num_householder) # 64 * 8 when num householder is 5 
 
     q_new = q.new_zeros(q.shape[0], q.shape[1], num_householder, q.shape[2], q.shape[3])
@@ -154,7 +155,7 @@ def chunk_gated_delta_product_bwd(
     from fla.ops.gated_delta_product.wy_fast import recompute_w_u_expanded
 
     w, u = recompute_w_u_expanded(
-        k=k, v=v, beta=beta, A_expanded=A, g=g_interleaved_N, cu_seqlens=cu_seqlens_dp, 
+        k=k, v=v, beta=beta, A_expanded=A, g=g_interleaved_N, cu_seqlens=cu_seqlens_dp, N=expanded_chunk_size
     )
 
     # w, u = recompute_w_u_fwd(
@@ -188,6 +189,7 @@ def chunk_gated_delta_product_bwd(
         initial_state=initial_state,
         output_final_state=False,
         cu_seqlens=cu_seqlens_dp,
+        chunk_size = chunk_size,
         num_householder=num_householder,
     )
 
@@ -215,7 +217,7 @@ def chunk_gated_delta_product_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens_dp,
         # chunk_size=64*num_householder,
-        chunk_size=64,
+        chunk_size=chunk_size,
         num_householder=num_householder
     )
 
@@ -245,8 +247,8 @@ def chunk_gated_delta_product_bwd(
     dh, dh0, du = chunk_gated_delta_product_bwd_dhu(
         q=q_org,                   # Use original q (not expanded)
         k=k,                       # k is already expanded (B, T*num_householder, H, K)
-        v=v_new,                   # v_new from forward pass (U[t] - W[t]H[t]^T)
-        g=g_interleaved_N,                       # Use original g (not interleaved)
+        w=w,                       # pass W (not v_new)
+        g=g_interleaved_N,         # Use original g (not interleaved)
         h0=initial_state,
         dht=dht,
         do=do_org,                 # Use original do (not expanded)
@@ -254,7 +256,7 @@ def chunk_gated_delta_product_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens_dp,  # Expanded sequence lengths
         num_householder=num_householder,
-        chunk_size=64,
+        chunk_size=chunk_size,
     )
 
     # Use optimized delta product backward for output gradients
@@ -317,7 +319,7 @@ def chunk_gated_delta_product_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens_dp,  # cu_seqlens * num_householder
         # chunk_size=64*num_householder,
-        chunk_size=64,
+        chunk_size=chunk_size,
     )
 
 
@@ -343,7 +345,7 @@ def chunk_gated_delta_product_bwd(
     #     chunk_size=64,
     # )
 
-    from fla.ops.gated_delta_product.wy_fast import prepare_wy_repr_bwd
+    from fla.ops.gated_delta_product.wy_fast import prepare_wy_repr_bwd_expanded
     dk_hidden_state_gradient, dv, dbeta, dg2 = prepare_wy_repr_bwd_expanded(
         k=k,
         v=v,
@@ -353,8 +355,9 @@ def chunk_gated_delta_product_bwd(
         dw=dw,  # Use key gradients from output as weights gradients
         du=du,  # Use value gradients from hidden tate backward
         cu_seqlens=cu_seqlens_dp,
+        N = expanded_chunk_size,
         # chunk_size=64*num_householder,
-        chunk_size=64,
+        # chunk_size=chunk_size,
     )
 
     # Accumulate gradients

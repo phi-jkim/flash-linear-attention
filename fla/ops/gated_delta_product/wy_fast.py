@@ -8,13 +8,17 @@ import triton
 import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
-from fla.ops.utils.op import exp
-from fla.utils import check_shared_mem
+from fla.ops.utils.op import exp  # not used directly, but kept for parity
+from fla.utils import check_shared_mem  # imported for parity; not used below
 
+
+# -----------------------------------------------------------------------------
 # Expanded-chunk recompute W/U using 64-row micro-tiles.
 # N must be a multiple of 64. A_expanded is (B, T, H, N) with columns aligned
 # to the expanded window [t0, t0+N), i.e., col index 0..N-1 == absolute j = t0+col.
 # For rows outside [t0, t0+N), or j > i, A should be zero (lower-tri masked).
+# -----------------------------------------------------------------------------
+
 
 @triton.heuristics({
     'USE_G':  lambda args: args['g']  is not None,
@@ -45,11 +49,11 @@ def recompute_w_u_fwd_kernel_expanded(
     N: tl.constexpr,   # expanded chunk size (N % 64 == 0)
     BK: tl.constexpr,
     BV: tl.constexpr,
+    BT: tl.constexpr,  # micro-tile height (64)
     USE_G: tl.constexpr,
     USE_GK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    BT = 64
     M = N // BT  # number of micro-tiles within the expanded window
     pid_exp = tl.program_id(0)
     i_bh = tl.program_id(1)
@@ -156,16 +160,20 @@ def recompute_w_u_expanded(
     beta: torch.Tensor,         # (B, T, H)
     A_expanded: torch.Tensor,   # (B, T, H, N): per-row, cols 0..N-1 align to absolute j=t0..t0+N-1
     *,
-    N: int,                     # multiple of 64
     g: Optional[torch.Tensor] = None,     # (B, T, H)
     gk: Optional[torch.Tensor] = None,    # (B, T, H, K)
     cu_seqlens: Optional[torch.LongTensor] = None,
     BK: int = 64,
     BV: int = 64,
+    BT: int = 64,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert N % 64 == 0, "N must be a multiple of 64"
+    """
+    Recompute W and U over expanded windows. N is inferred from A_expanded.shape[-1].
+    """
     B, T, H, K = k.shape
     V = v.shape[-1]
+    N = A_expanded.shape[-1]
+    assert N % 64 == 0, "N must be a multiple of 64"
     assert A_expanded.shape == (B, T, H, N), "A_expanded must be (B, T, H, N)"
 
     if cu_seqlens is None:
@@ -182,9 +190,14 @@ def recompute_w_u_expanded(
     recompute_w_u_fwd_kernel_expanded[(NT_expanded, B * H)](
         k=k, v=v, beta=beta, w=w, u=u, A=A_expanded,
         g=g, gk=gk, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
-        T=T, H=H, K=K, V=V, N=N, BK=BK, BV=BV,
+        T=T, H=H, K=K, V=V, N=N, BK=BK, BV=BV, BT=BT,
     )
     return w, u
+
+
+# -----------------------------------------------------------------------------
+# Backward: prepare WY representation gradients on expanded windows
+# -----------------------------------------------------------------------------
 
 
 @triton.heuristics({
@@ -214,10 +227,10 @@ def prepare_wy_repr_bwd_kernel_expanded(
     H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     N: tl.constexpr,         # expanded window size (multiple of 64)
     BK: tl.constexpr, BV: tl.constexpr,
+    BT: tl.constexpr,        # micro-tile height (64)
     IS_VARLEN: tl.constexpr,
 ):
     # ---- micro-tiling ----
-    BT = 64
     M = N // BT  # number of 64-row micro-tiles within expanded window
 
     pid_exp = tl.program_id(0)     # expanded-chunk id
@@ -285,10 +298,7 @@ def prepare_wy_repr_bwd_kernel_expanded(
             for c in range(r + 1):
                 col_off = t0 + c * BT
 
-                # A_{r,c} (masking later is based on absolute i/j)
-                # Note: for dA construction we don’t need A values here; we’ll
-                # use A_rr in the local transforms just like your original code.
-                # (The bare dA term depends on upstream *and* source-side k/v/beta/g).
+                # source-side scalars
                 p_beta_c = tl.make_block_ptr(base_beta, (Tseq,), (H,), (col_off,), (BT,), (0,))
                 p_g_c    = tl.make_block_ptr(base_g,    (Tseq,), (H,), (col_off,), (BT,), (0,))
                 b_beta_c = tl.load(p_beta_c, boundary_check=(0,))
@@ -333,21 +343,18 @@ def prepare_wy_repr_bwd_kernel_expanded(
         m_j = o_j < Tseq
         m_lower_rr = (o_i[:, None] > o_j[None, :]) & (m_i[:, None] & m_j[None, :])
 
-        # Keep only strictly-lower entries as in your original code
+        # Keep only strictly-lower entries
         b_dA_r = tl.where(m_lower_rr, b_dA_r, 0)
 
-        # ---- local transforms with A_rr (same as your original: dA = dA*A + A*dA) ----
+        # ---- local transforms with A_rr (dA := A*dA*A) ----
         tmp = tl.dot(b_dA_r.to(b_A_rr.dtype), b_A_rr)
         b_dA_r = tl.dot(b_A_rr, tmp.to(b_A_rr.dtype))
 
-        # ---- apply -exp(g_i - g_j) scaling (row-tile g on both i and j, as in original) ----
-        # Note: original did exp(b_g[:,None] - b_g[None,:]) from the *same* tile’s g.
-        # We mirror that here for the local (r,r) block post-transform.
-        scale = tl.exp(b_g_r[:, None] - b_g_r[None, :])
-        b_dA_r = tl.where(m_lower_rr, -b_dA_r * scale, 0)
+        # ---- apply -exp(g_i - g_j) scaling (row-tile g on both i and j) ----
+        scale_rr = tl.exp(b_g_r[:, None] - b_g_r[None, :])
+        b_dA_r = tl.where(m_lower_rr, -b_dA_r * scale_rr, 0)
 
-        # ---- SECOND PASS over K for dk/dbeta using b_dA_r (same as original) ----
-        # Rebuild b_A_k (local statistic) and apply b_dA_r contributions to k/beta.
+        # ---- SECOND PASS over K for dk/dbeta using b_dA_r ----
         b_A_k = tl.zeros((BT, BT), dtype=tl.float32)
 
         for ik in range(tl.cdiv(K, BK)):
@@ -360,13 +367,12 @@ def prepare_wy_repr_bwd_kernel_expanded(
 
             b_k_beta_r = (b_k_r * b_beta_r[:, None]).to(b_k_r.dtype)
 
-            # accumulate local b_A_k (like original)
+            # accumulate local b_A_k
             b_A_k += tl.dot(b_k_beta_r, tl.trans(b_k_r)).to(tl.float32)
 
-            # apply dA term to k/beta (like original)
+            # apply dA term to k/beta
             b_dk_beta_r = tl.dot(b_dA_r, b_k_r)
             # dbeta add
-            # sum over feature dim (axis=1 on BT×BK against b_k_r)
             dbeta_add = tl.sum(b_dk_beta_r * b_k_r, 1)
             # update dk_r
             b_dk_r += tl.dot(tl.trans(b_dA_r), b_k_beta_r)
@@ -374,15 +380,12 @@ def prepare_wy_repr_bwd_kernel_expanded(
 
             tl.store(p_dk_r, b_dk_r.to(p_dk_r.dtype.element_ty), boundary_check=(0, 1))
 
-            # accumulate into scalar dbeta buffer (we store after dv step to avoid extra loads)
-            # We keep it in registers here by reusing b_beta_r after dv loop.
-            # To persist across feature tiles, we’ll accumulate to a local vector:
             if ik == 0:
                 b_dbeta_r = dbeta_add.to(tl.float32)
             else:
                 b_dbeta_r += dbeta_add.to(tl.float32)
 
-        # ---- DV path for the *row tile r only* (as in original) ----
+        # ---- DV path for the *row tile r only* ----
         for iv in range(tl.cdiv(V, BV)):
             p_v_r  = tl.make_block_ptr(base_v,  (Tseq, V), (H * V, 1),
                                        (row_off, iv * BV), (BT, BV), (1, 0))
@@ -404,7 +407,7 @@ def prepare_wy_repr_bwd_kernel_expanded(
 
             tl.store(p_dv_r, b_dv_r.to(p_dv_r.dtype.element_ty), boundary_check=(0, 1))
 
-        # ---- dg (same as original using local b_A_k) ----
+        # ---- dg using local b_A_k ----
         b_dA_A = b_dA_r * b_A_k
         b_dg_r = tl.sum(b_dA_A, axis=1) - tl.sum(b_dA_A, axis=0)
 
@@ -425,24 +428,27 @@ def prepare_wy_repr_bwd_expanded(
     du: torch.Tensor,         # (B, T, H, V)
     cu_seqlens: Optional[torch.LongTensor],
     *,
-    N: int,                   # Expanded chunk length (multiple of 64)
+    BK_hint: int = 64,
+    BV_hint: int = 64,
+    BT: int = 64,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Backward over an expanded causal window of length N (N % 64 == 0),
     computed internally with 64-row micro-tiles.
+    N is inferred from A_expanded.shape[-1].
     """
-    assert N % 64 == 0, "N must be a multiple of 64"
     B, T, H, K = k.shape
     V = v.shape[-1]
+    N = A_expanded.shape[-1]
+    assert N % 64 == 0, "N must be a multiple of 64"
     assert A_expanded.shape == (B, T, H, N), "A_expanded must be (B, T, H, N)"
 
     # Tiling for feature dims (keep it conservative and Triton-friendly)
-    # Use min/max bounds like your existing wrapper logic but avoid external deps.
     def _next_pow2(x: int) -> int:
         return 1 if x <= 1 else 1 << (x - 1).bit_length()
     CONST_TILING = 64
-    BK = min(max(_next_pow2(K), 16), CONST_TILING)
-    BV = min(max(_next_pow2(V), 16), CONST_TILING)
+    BK = min(max(_next_pow2(K), 16), CONST_TILING) if BK_hint is None else min(BK_hint, CONST_TILING)
+    BV = min(max(_next_pow2(V), 16), CONST_TILING) if BV_hint is None else min(BV_hint, CONST_TILING)
 
     # Chunking grid over expanded windows
     if cu_seqlens is None:
@@ -463,6 +469,6 @@ def prepare_wy_repr_bwd_expanded(
         dw=dw, du=du,
         dk=dk, dv=dv, dbeta=dbeta_, dg=dg_,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
-        T=T, H=H, K=K, V=V, N=N, BK=BK, BV=BV,
+        T=T, H=H, K=K, V=V, N=N, BK=BK, BV=BV, BT=BT,
     )
     return dk, dv, dbeta_, dg_
