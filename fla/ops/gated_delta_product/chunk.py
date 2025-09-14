@@ -320,6 +320,7 @@ def chunk_gated_delta_product_bwd(
         cu_seqlens=cu_seqlens_dp,  # cu_seqlens * num_householder
         # chunk_size=64*num_householder,
         chunk_size=chunk_size,
+        num_householder=num_householder,
     )
 
 

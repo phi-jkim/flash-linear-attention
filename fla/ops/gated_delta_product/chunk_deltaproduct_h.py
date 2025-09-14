@@ -712,7 +712,7 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
 
         # 4) dh update inside the group: restrict TRUE columns to this expanded group
         j0_true = chunk_lo // M
-        o_col_exp = chunk_lo + (M - 1) + tl.arange(0, ) * M
+        o_col_exp = chunk_lo + (M - 1) + tl.arange(0, BTC) * M
         m_cols = (o_col_exp < chunk_hi) & ((j0_true + tl.arange(0, BTC)) < T_true)
 
         if is_group_entry:

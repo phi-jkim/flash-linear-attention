@@ -347,9 +347,7 @@ def chunk_gated_delta_product_bwd_dv_local(
     return dv
 
 
-# =========================================================
-# Backward: dQ/dK/(optional dW) with grouping over expanded chunks
-# =========================================================
+
 @triton.heuristics({
     'USE_G':        lambda args: args['g'] is not None,
     'USE_G_GAMMA':  lambda args: args['g_gamma'] is not None,
@@ -369,7 +367,7 @@ def chunk_bwd_kernel_dqkwg(
     q,              # [B, T_true, H, K] (TRUE timeline)
     k,              # [B, T_exp,  H, K] (EXPANDED timeline)
     v,              # [B, T_exp,  H, V] (EXPANDED)
-    h,              # [B, NTG,    H, V, K] (only if USE_DW)
+    h,              # [B, NTG,    H, V, K] (only if USE_DW; slab layout [V,K])
     g,              # [B, T_exp,  H] (EXPANDED, log-space), optional
     g_gamma,        # unused
     do,             # [B, T_true, H, V] (TRUE)
@@ -380,7 +378,7 @@ def chunk_bwd_kernel_dqkwg(
     dv,             # [B, T_exp,  H, V] (EXPANDED), optional (for dw)
     dw,             # [B, T_exp,  H, K] (EXPANDED) OUT if USE_DW
     cu_seqlens,     # [B+1] expanded lengths or None
-    chunk_indices,  # not used here (API parity)
+    chunk_indices,  # unused (API parity)
     scale,          # float
     B: tl.constexpr,
     T,              # expanded length per sequence if fixed-length
@@ -388,41 +386,36 @@ def chunk_bwd_kernel_dqkwg(
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    BT: tl.constexpr,      # base tile along EXPANDED axis; group size uses GRP
+    BT: tl.constexpr,      # row tile along EXPANDED axis
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     USE_G_GAMMA: tl.constexpr,
     USE_DW: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NTG: tl.constexpr,     # number of expanded-chunk groups per sequence
+    NTG: tl.constexpr,     # # of expanded-chunk groups per sequence
     expanded_chunk_size: tl.constexpr,  # == BT * next_power_of_2(num_householder)
-    BTC: tl.constexpr,
+    BTC: tl.constexpr,     # == ceil(expanded_chunk_size / num_householder)
 ):
     # program ids
     i_kblk, i_grp, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
 
     # geometry
-    M   = num_householder
+    M         = num_householder
     EXP_CHUNK = expanded_chunk_size
-    GRP = EXP_CHUNK // BT
-    # BTC = (EXP_CHUNK + M - 1) // M  # ceil(EXP_CHUNK / M)
-    # In Python code before kernel launch
-    # BTC = (expanded_chunk_size + num_householder - 1) // num_householder
+    GRP       = EXP_CHUNK // BT
 
     # sequence bounds (expanded)
     if IS_VARLEN:
-        bos_e = tl.load(cu_seqlens + i_b).to(tl.int32)
-        eos_e = tl.load(cu_seqlens + i_b + 1).to(tl.int32)
+        bos_e  = tl.load(cu_seqlens + i_b).to(tl.int32)
+        eos_e  = tl.load(cu_seqlens + i_b + 1).to(tl.int32)
         Tloc_e = eos_e - bos_e
-        NT_grp = tl.cdiv(Tloc_e, EXP_CHUNK)
         chunk_lo = i_grp * EXP_CHUNK
         chunk_hi = tl.minimum(chunk_lo + EXP_CHUNK, Tloc_e)
     else:
         bos_e   = i_b * T
         Tloc_e  = T
-        NT_grp  = tl.cdiv(Tloc_e, EXP_CHUNK)
         chunk_lo = i_grp * EXP_CHUNK
         chunk_hi = tl.minimum(chunk_lo + EXP_CHUNK, Tloc_e)
 
@@ -442,7 +435,7 @@ def chunk_bwd_kernel_dqkwg(
         w  += ((bos_e * H + i_h) * K)
         dv += ((bos_e * H + i_h) * V)
         dw += ((bos_e * H + i_h) * K)
-        # h slab per (batch, group, head) with layout [V, K]
+        # h slab per (batch, group, head): [V, K]
         h  += (((i_b * NTG + i_grp) * H + i_h) * (V * K))
     if USE_G:
         g  += ((bos_e * H + i_h))
@@ -459,9 +452,9 @@ def chunk_bwd_kernel_dqkwg(
     o_col_exp = chunk_lo + (M - 1) + j_rel * M
     m_cols_e  = o_col_exp < chunk_hi
     m_cols_t  = (j0_true + j_rel) < Tloc_t
-    m_cols    = m_cols_e & m_cols_t
+    m_cols    = m_cols_e & m_cols_t  # which TRUE cols we actually own
 
-    # Load Q slab and mask columns
+    # Load Q slab and mask columns not owned by this group
     p_q = tl.make_block_ptr(q, (K, Tloc_t), (1, stride_true_k),
                             (i_kblk * BK, j0_true), (BK, BTC), (0, 1))
     b_q = tl.load(p_q, boundary_check=(0, 1))            # [BK, BTC]
@@ -512,7 +505,7 @@ def chunk_bwd_kernel_dqkwg(
         if USE_G:
             p_gr = tl.make_block_ptr(g, (Tloc_e,), (H,), (tile_row_base,), (BT,), (0,))
             b_gr = tl.load(p_gr, boundary_check=(0,))                  # [BT]
-            b_gc = tl.load(g + o_col_exp * H, mask=m_cols, other=0.0)  # [BTC]
+            b_gc = tl.load(g + o_col_exp * H, mask=m_cols, other=0.0)  # [BTC] (scalar ptr, mask ok)
             gate = tl.exp(b_gc[None, :] - b_gr[:, None])               # [BT,BTC]
             b_dA_T = b_dA_T * gate * scale
         else:
@@ -529,25 +522,39 @@ def chunk_bwd_kernel_dqkwg(
         # dK tile = dA_T @ Q^T
         b_dk_tile = tl.dot(b_dA_T.to(b_q.dtype), tl.trans(b_q))  # [BT, BK]
 
-        # store dk (masked by active rows)
+        # ---- stores for dk/dw: block-ptr (fast), no mask ----
+        # boundary_check covers row/col tails; invalid lanes already zeroed above
         p_dk = tl.make_block_ptr(dk, (Tloc_e, K), (stride_exp_k, 1),
                                  (tile_row_base, i_kblk * BK), (BT, BK), (1, 0))
-        tl.store(p_dk, b_dk_tile.to(p_dk.dtype.element_ty),
-                 mask=m_rows[:, None], boundary_check=(0, 1))
+        tl.store(p_dk, b_dk_tile.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
 
         if USE_DW:
             p_dw = tl.make_block_ptr(dw, (Tloc_e, K), (stride_exp_k, 1),
                                      (tile_row_base, i_kblk * BK), (BT, BK), (1, 0))
-            tl.store(p_dw, (-b_dw_tile).to(p_dw.dtype.element_ty),
-                     mask=m_rows[:, None], boundary_check=(0, 1))
+            tl.store(p_dw, (-b_dw_tile).to(p_dw.dtype.element_ty), boundary_check=(0, 1))
 
-    # final masked store for dQ over TRUE columns owned by this group
+    # ---- final store for dQ over TRUE columns owned by this group ----
+    # Use masked *linear* stores (not block-ptr) to avoid cross-CTA overwrite when
+    # EXP_CHUNK is not a multiple of M: some BTC lanes may belong to the next group.
+    # We still build a block-ptr just to get the dtype for correct casting.
     p_dq_cols = tl.make_block_ptr(
         dq, (Tloc_t, K), (stride_true_k, 1),
         (j0_true, i_kblk * BK), (BTC, BK), (1, 0)
     )
-    dq_tile = tl.trans(b_dq_cols).to(p_dq_cols.dtype.element_ty)  # [BTC,BK]
-    tl.store(p_dq_cols, dq_tile, mask=m_cols[:, None], boundary_check=(0, 1))
+    dq_elty = p_dq_cols.dtype.element_ty
+
+    cols_true = j0_true + tl.arange(0, BTC)            # [BTC]
+    k_cols    = i_kblk * BK + tl.arange(0, BK)         # [BK]
+    mask_k    = k_cols < K
+
+    dq_tile = tl.trans(b_dq_cols)  # [BTC, BK]
+
+    # store column-by-column with a proper mask
+    for j in range(BTC):
+        col_ok = m_cols[j]                                 # scalar: this TRUE col belongs to this group
+        offs   = cols_true[j] * stride_true_k + k_cols     # [BK]
+        vals   = dq_tile[j, :].to(dq_elty)                 # [BK]
+        tl.store(dq + offs, vals, mask=col_ok & mask_k)
 
 
 def chunk_bwd_dqkwg(
@@ -568,7 +575,7 @@ def chunk_bwd_dqkwg(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Backward for dQ/dK and (optionally) dW. Operates by grouping EXPANDED chunks.
-    - If you want dW, pass both `w` and `dv` (and provide `h` slabs).
+    - If you want dW, pass both `w` and `dv` (and provide `h` slabs with [V,K] layout per group).
     - Varlen: pass EXPANDED cu_seqlens (lengths on the expanded axis).
     """
     scale = 1.0 if scale is None else float(scale)
@@ -587,14 +594,19 @@ def chunk_bwd_dqkwg(
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NK = triton.cdiv(K, BK)
-    BTC = (EXP_CHUNK + M - 1) // M
+    BTC = (EXP_CHUNK + M - 1) // M  # ceil(expanded_chunk / M)
 
-    # expanded grouping
+    # number of expanded groups per sequence
     if cu_seqlens is None:
         NTG = triton.cdiv(T_exp, EXP_CHUNK)
     else:
-        # Use the padded-expanded length to derive a safe upper bound of groups
-        NTG = triton.cdiv(int(cu_seqlens[-1].item() - cu_seqlens[-2].item() if len(cu_seqlens) > 1 else cu_seqlens[-1].item()), EXP_CHUNK)  # conservative
+        # conservative: derive groups from per-seq expanded length;
+        # cu_seqlens is expanded lengths, so last - prev is max length here
+        if cu_seqlens.numel() >= 2:
+            seq_len_e = int(cu_seqlens[-1].item() - cu_seqlens[-2].item())
+        else:
+            seq_len_e = int(cu_seqlens[-1].item())
+        NTG = triton.cdiv(seq_len_e, EXP_CHUNK)
 
     grid = (NK, NTG, B * H)
 
