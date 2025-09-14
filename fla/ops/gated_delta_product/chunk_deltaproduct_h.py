@@ -599,7 +599,6 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
     if K > 192: b_dh4 = tl.zeros([64, BV], dtype=tl.float32)
 
     # PRE snapshots (constant within a group, refreshed at group entry)
-    # (SSA assignment = snapshot)
     b_dh1_pre = b_dh1
     if K > 64:  b_dh2_pre = b_dh2
     if K > 128: b_dh3_pre = b_dh3
@@ -619,10 +618,13 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
             p_dht_192 = tl.make_block_ptr(dht, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
             b_dh4 += tl.load(p_dht_192, boundary_check=(0, 1))
 
-    # reverse tiles
-    for i_t in range(NT - 1, -1, -1):
+    # reverse over tiles by iterating forward and mapping index
+    for it in range(NT):
+        i_t = NT - 1 - it  # logical reverse index
+
         # 1) TOP-OF-LOOP STORE at expanded-chunk boundary
-        if (i_t + 1 == NT) or (((i_t + 1) % GRP) == 0):
+        is_boundary = ((i_t + 1 == NT) or (((i_t + 1) % GRP) == 0))
+        if is_boundary:
             i_grp = (NT_grp - 1) if (i_t + 1 == NT) else (((i_t + 1) // GRP) - 1)
             p_dh = tl.make_block_ptr(dh + i_grp * stride_h, (K, V), (V, 1),
                                      (0, i_v * BV), (64, BV), (1, 0))
@@ -649,7 +651,7 @@ def chunk_gated_delta_product_bwd_kernel_dhu_blockdim64(
         last_idx = chunk_hi - 1
 
         # 2) GROUP ENTRY (first tile from the right)
-        is_group_entry = i_t == (grp_hi_tiles - 1) or i_t == (NT - 1)
+        is_group_entry = (i_t == (grp_hi_tiles - 1)) or (i_t == (NT - 1))
         if USE_G:
             bg_last = tl.load(g + last_idx * H)
             if is_group_entry:
