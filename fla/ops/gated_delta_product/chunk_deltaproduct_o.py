@@ -12,7 +12,7 @@ from fla.utils import check_shared_mem, is_nvidia_hopper
 
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
-NUM_WARPS = [2, 4] if is_nvidia_hopper() else [2, 4, 8]
+NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
 
 # =========================
@@ -200,6 +200,7 @@ def chunk_gated_delta_product_bwd_kernel_dv_local(
     IS_VARLEN: tl.constexpr,
     num_householder: tl.constexpr,
     expanded_chunk_size: tl.constexpr,   # == BT * next_power_of_2(num_householder)
+    BTC: tl.constexpr,                   # == ceil(expanded_chunk_size / num_householder)
 ):
     # program ids
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
@@ -207,7 +208,6 @@ def chunk_gated_delta_product_bwd_kernel_dv_local(
 
     M = num_householder
     EXP_CHUNK = expanded_chunk_size
-    BTC = (EXP_CHUNK + M - 1) // M  # ceil(EXP_CHUNK / M)
 
     # sequence bounds (expanded)
     if IS_VARLEN:
@@ -241,7 +241,7 @@ def chunk_gated_delta_product_bwd_kernel_dv_local(
 
     chunk_lo = (row_start // EXP_CHUNK) * EXP_CHUNK
     j0_true  = chunk_lo // M
-    o_col_exp = j0_true * M + (M - 1) + tl.arange(0, BTC) * M
+    o_col_exp = (j0_true * M + (M - 1) + tl.arange(0, BTC) * M).to(tl.int32)
     m_col_exp = (o_col_exp < Tloc) & (o_col_exp < (chunk_lo + EXP_CHUNK))
 
     # A = K_rows(expanded) @ Q_cols(TRUE)  => [BT, BTC]
@@ -304,6 +304,7 @@ def chunk_gated_delta_product_bwd_dv_local(
     GRP = triton.next_power_of_2(M)
     BT = chunk_size
     expanded_chunk_size = BT * GRP
+    BTC = (expanded_chunk_size + M - 1) // M  # ceil(expanded_chunk_size / M)
 
     # tiling for K/V
     if check_shared_mem('hopper', k.device.index):
@@ -329,7 +330,7 @@ def chunk_gated_delta_product_bwd_dv_local(
         q=q, k=k, g=g, g_gamma=g_gamma, do=do, dv=dv,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, scale=scale,
         T=T_exp, H=H, K=K, V=V, BT=BT, BK=BK, BV=BV,
-        num_householder=M, expanded_chunk_size=expanded_chunk_size,
+        num_householder=M, expanded_chunk_size=expanded_chunk_size, BTC=BTC,
     )
     return dv
 

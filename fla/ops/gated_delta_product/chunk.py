@@ -155,7 +155,7 @@ def chunk_gated_delta_product_bwd(
     from fla.ops.gated_delta_product.wy_fast import recompute_w_u_expanded
 
     w, u = recompute_w_u_expanded(
-        k=k, v=v, beta=beta, A_expanded=A, g=g_interleaved_N, cu_seqlens=cu_seqlens_dp, N=expanded_chunk_size
+        k=k, v=v, beta=beta, A_expanded=A, g=g_interleaved_N, cu_seqlens=cu_seqlens_dp
     )
 
     # w, u = recompute_w_u_fwd(
