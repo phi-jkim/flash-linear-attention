@@ -347,7 +347,6 @@ def chunk_gated_delta_product_bwd_dv_local(
     return dv
 
 
-
 @triton.heuristics({
     'USE_G':        lambda args: args['g'] is not None,
     'USE_G_GAMMA':  lambda args: args['g_gamma'] is not None,
@@ -419,7 +418,7 @@ def chunk_bwd_kernel_dqkwg(
         chunk_lo = i_grp * EXP_CHUNK
         chunk_hi = tl.minimum(chunk_lo + EXP_CHUNK, Tloc_e)
 
-    # TRUE length
+    # TRUE length for this (batch, head)
     Tloc_t = Tloc_e // M
 
     # base offsets per (batch, head)
@@ -449,12 +448,12 @@ def chunk_bwd_kernel_dqkwg(
     # TRUE columns covered by this expanded-chunk group
     j0_true   = chunk_lo // M
     j_rel     = tl.arange(0, BTC)
-    o_col_exp = chunk_lo + (M - 1) + j_rel * M
-    m_cols_e  = o_col_exp < chunk_hi
-    m_cols_t  = (j0_true + j_rel) < Tloc_t
-    m_cols    = m_cols_e & m_cols_t  # which TRUE cols we actually own
+    o_col_exp = chunk_lo + (M - 1) + j_rel * M       # [BTC] (expanded indices of TRUE columns' last elem)
+    m_cols_e  = o_col_exp < chunk_hi                 # [BTC]
+    m_cols_t  = (j0_true + j_rel) < Tloc_t           # [BTC]
+    m_cols    = m_cols_e & m_cols_t                  # [BTC], bool
 
-    # Load Q slab and mask columns not owned by this group
+    # Load Q slab and zero columns not owned by this group
     p_q = tl.make_block_ptr(q, (K, Tloc_t), (1, stride_true_k),
                             (i_kblk * BK, j0_true), (BK, BTC), (0, 1))
     b_q = tl.load(p_q, boundary_check=(0, 1))            # [BK, BTC]
@@ -505,7 +504,7 @@ def chunk_bwd_kernel_dqkwg(
         if USE_G:
             p_gr = tl.make_block_ptr(g, (Tloc_e,), (H,), (tile_row_base,), (BT,), (0,))
             b_gr = tl.load(p_gr, boundary_check=(0,))                  # [BT]
-            b_gc = tl.load(g + o_col_exp * H, mask=m_cols, other=0.0)  # [BTC] (scalar ptr, mask ok)
+            b_gc = tl.load(g + o_col_exp * H, mask=m_cols, other=0.0)  # [BTC]
             gate = tl.exp(b_gc[None, :] - b_gr[:, None])               # [BT,BTC]
             b_dA_T = b_dA_T * gate * scale
         else:
@@ -517,67 +516,55 @@ def chunk_bwd_kernel_dqkwg(
         b_dA_T = tl.where(m_tri & m_rc, b_dA_T, 0.0)
 
         # dQ contribution:  K^T @ dA_T
-        b_dq_cols += tl.dot(tl.trans(b_k), b_dA_T.to(b_k.dtype))
+        b_dq_cols += tl.dot(tl.trans(b_k), b_dA_T.to(b_k.dtype))  # [BK,BTC]
 
         # dK tile = dA_T @ Q^T
         b_dk_tile = tl.dot(b_dA_T.to(b_q.dtype), tl.trans(b_q))  # [BT, BK]
 
-        # ---- stores for dk/dw: block-ptr (fast), no mask ----
-        # boundary_check covers row/col tails; invalid lanes already zeroed above
+        # dk / dw stores via block-pointers (no mask; boundary_check handles tails)
         p_dk = tl.make_block_ptr(dk, (Tloc_e, K), (stride_exp_k, 1),
                                  (tile_row_base, i_kblk * BK), (BT, BK), (1, 0))
         tl.store(p_dk, b_dk_tile.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
-
         if USE_DW:
             p_dw = tl.make_block_ptr(dw, (Tloc_e, K), (stride_exp_k, 1),
                                      (tile_row_base, i_kblk * BK), (BT, BK), (1, 0))
             tl.store(p_dw, (-b_dw_tile).to(p_dw.dtype.element_ty), boundary_check=(0, 1))
 
-    # ---- final store for dQ over TRUE columns owned by this group ----
-    # Use masked *linear* stores (not block-ptr) to avoid cross-CTA overwrite when
-    # EXP_CHUNK is not a multiple of M: some BTC lanes may belong to the next group.
-    # We still build a block-ptr just to get the dtype for correct casting.
-    p_dq_cols = tl.make_block_ptr(
-        dq, (Tloc_t, K), (stride_true_k, 1),
-        (j0_true, i_kblk * BK), (BTC, BK), (1, 0)
-    )
-    dq_elty = p_dq_cols.dtype.element_ty
+    # ---- dq store: per-column masked linear stores (avoid SSA indexing) ----
+    k_cols = i_kblk * BK + tl.arange(0, BK)           # [BK]
+    mask_k = k_cols < K
 
-    cols_true = j0_true + tl.arange(0, BTC)            # [BTC]
-    k_cols    = i_kblk * BK + tl.arange(0, BK)         # [BK]
-    mask_k    = k_cols < K
+    for j in tl.static_range(0, BTC):
+        # recompute scalar column validity (no SSA indexing)
+        col_exp_j  = chunk_lo + (M - 1) + j * M
+        col_true_j = j0_true + j
+        col_ok     = (col_exp_j < chunk_hi) & (col_true_j < Tloc_t)
 
-    dq_tile = tl.trans(b_dq_cols)  # [BTC, BK]
+        # one-hot select the j-th column from b_dq_cols: [BK,BTC] -> [BK]
+        selector = (tl.arange(0, BTC) == j).to(b_dq_cols.dtype)  # [BTC]
+        vals_k   = tl.sum(b_dq_cols * selector[None, :], axis=1) # [BK], fp32
 
-    # store column-by-column with a proper mask
-    for j in range(BTC):
-        col_ok = m_cols[j]                                 # scalar: this TRUE col belongs to this group
-        offs   = cols_true[j] * stride_true_k + k_cols     # [BK]
-        vals   = dq_tile[j, :].to(dq_elty)                 # [BK]
-        tl.store(dq + offs, vals, mask=col_ok & mask_k)
+        base = (col_true_j * stride_true_k + i_kblk * BK).to(tl.int64)
+        ptr  = dq + base + k_cols
+        tl.store(ptr, vals_k.to(b_q.dtype), mask=mask_k & col_ok)
 
 
 def chunk_bwd_dqkwg(
-    q: torch.Tensor,           # [B, T_true, H, K]  (TRUE)
-    k: torch.Tensor,           # [B, T_exp,  H, K]  (EXPANDED)
+    q: torch.Tensor,           # [B, T_true, H, K]
+    k: torch.Tensor,           # [B, T_exp,  H, K]
     v: torch.Tensor,           # [B, T_exp,  H, V]
     do: torch.Tensor,          # [B, T_true, H, V]
-    h: torch.Tensor = None,    # used only if computing dw; expected [B, NTG, H, V, K]
-    dh: torch.Tensor = None,   # unused (signature parity)
+    h: torch.Tensor = None,    # [B, NTG, H, V, K] if dw
+    dh: torch.Tensor = None,
     g: torch.Tensor = None,    # [B, T_exp, H] or None
     g_gamma: torch.Tensor = None,
-    dv: torch.Tensor = None,   # [B, T_exp, H, V] if computing dw
-    w: torch.Tensor = None,    # [B, T_exp, H, K] if computing dw
+    dv: torch.Tensor = None,   # [B, T_exp, H, V] if dw
+    w: torch.Tensor = None,    # [B, T_exp, H, K] if dw
     cu_seqlens: torch.LongTensor = None,  # EXPANDED lengths or None
     chunk_size: int = 64,
     scale: float = 1.0,
     num_householder: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Backward for dQ/dK and (optionally) dW. Operates by grouping EXPANDED chunks.
-    - If you want dW, pass both `w` and `dv` (and provide `h` slabs with [V,K] layout per group).
-    - Varlen: pass EXPANDED cu_seqlens (lengths on the expanded axis).
-    """
     scale = 1.0 if scale is None else float(scale)
 
     B, T_true, H, K = q.shape
@@ -594,26 +581,21 @@ def chunk_bwd_dqkwg(
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NK = triton.cdiv(K, BK)
-    BTC = (EXP_CHUNK + M - 1) // M  # ceil(expanded_chunk / M)
+    BTC = (EXP_CHUNK + M - 1) // M  # ceil
 
-    # number of expanded groups per sequence
+    # expanded grouping
     if cu_seqlens is None:
         NTG = triton.cdiv(T_exp, EXP_CHUNK)
     else:
-        # conservative: derive groups from per-seq expanded length;
-        # cu_seqlens is expanded lengths, so last - prev is max length here
-        if cu_seqlens.numel() >= 2:
-            seq_len_e = int(cu_seqlens[-1].item() - cu_seqlens[-2].item())
-        else:
-            seq_len_e = int(cu_seqlens[-1].item())
-        NTG = triton.cdiv(seq_len_e, EXP_CHUNK)
+        last = int(cu_seqlens[-1].item())
+        first = int(cu_seqlens[0].item())
+        NTG = triton.cdiv(last - first, EXP_CHUNK)
 
     grid = (NK, NTG, B * H)
 
     dq_out = torch.empty_like(q)
     dk_out = torch.empty_like(k)
 
-    # determine whether to compute dw
     compute_dw = (w is not None) and (dv is not None) and (h is not None)
     dw_out: Optional[torch.Tensor] = torch.empty_like(w) if compute_dw else None
 
