@@ -116,6 +116,8 @@ def chunk_gated_delta_product_bwd(
     num_householder: int = 1,
 ):
     chunk_size = 64
+    # check num_householder is power of 2
+    assert (num_householder & (num_householder - 1)) == 0, "num_householder must be power of 2"
     expanded_chunk_size = chunk_size * triton.next_power_of_2(num_householder) # 64 * 8 when num householder is 5 
 
     q_new = q.new_zeros(q.shape[0], q.shape[1], num_householder, q.shape[2], q.shape[3])
