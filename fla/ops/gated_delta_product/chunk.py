@@ -115,9 +115,8 @@ def chunk_gated_delta_product_bwd(
     initial_state: Optional[torch.Tensor] = None,
     num_householder: int = 1,
 ):
-    chunk_size = 64
+    chunk_size = 16
     # check num_householder is power of 2
-    assert (num_householder & (num_householder - 1)) == 0, "num_householder must be power of 2"
     expanded_chunk_size = chunk_size * triton.next_power_of_2(num_householder) # 64 * 8 when num householder is 5 
 
     q_new = q.new_zeros(q.shape[0], q.shape[1], num_householder, q.shape[2], q.shape[3])
@@ -139,7 +138,7 @@ def chunk_gated_delta_product_bwd(
 
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
-        g=g_interleaved,
+        g=g_interleaved_N,
         beta=beta,
         cu_seqlens=cu_seqlens_dp,
         output_dtype=torch.float32, 
@@ -313,7 +312,7 @@ def chunk_gated_delta_product_bwd(
         k=k,
         v=v_new,  # v_new = U[i] - W[i]H[i]^T
         w=w,
-        g=g_interleaved,  # should this be g or g_interleaved? since we don't find dk for the hidden states, is it g
+        g=g_interleaved_N,  # should this be g or g_interleaved? since we don't find dk for the hidden states, is it g
         h=h,
         dv=du,  # can be thought as gradient wrt v_new
         do=do_org,
