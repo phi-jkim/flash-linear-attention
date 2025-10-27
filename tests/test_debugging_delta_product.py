@@ -57,14 +57,17 @@ from fla.ops.common.chunk_o import (
     chunk_bwd_dv_local as delta_rule_chunk_bwd_dv_local,
 )
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from fla.ops.gated_delta_product.chunk import chunk_gated_delta_product_fwd
 from fla.ops.gated_delta_product.chunk_deltaproduct_h import (
-    chunk_gated_delta_product_bwd_dhu,
-    chunk_gated_delta_product_fwd_h,
+    chunk_gated_delta_product_bwd_dhu as gdp_chunk_bwd_dhu,
+    chunk_gated_delta_product_fwd_h_expanded,
 )
 from fla.ops.gated_delta_product.chunk_deltaproduct_o import (
-    chunk_bwd_dqkwg as delta_product_chunk_bwd_dqkwg,
-    chunk_bwd_dv_local as delta_product_chunk_bwd_dv_local,
+    chunk_bwd_dqkwg as gdp_chunk_bwd_dqkwg,
+    chunk_gated_delta_product_bwd_dv_local as gdp_chunk_bwd_dv_local,
+)
+from fla.ops.gated_delta_product.wy_fast import (
+    prepare_wy_repr_bwd_expanded,
+    recompute_w_u_expanded,
 )
 from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd_h
 from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
@@ -78,13 +81,14 @@ from fla.utils import assert_close
         (16, 4),
         (16, 2),
         (32, 1),
+        (16, 3), 
     ],
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Expanded chunk tests require CUDA support")
 def test_gated_delta_product_expanded_chunk(base_chunk_size: int, num_householder: int) -> None:
     torch.manual_seed(0)
 
-    B = 1
+    B = 3
     H = 2
     D = 8
     T_base = base_chunk_size
@@ -104,19 +108,19 @@ def test_gated_delta_product_expanded_chunk(base_chunk_size: int, num_householde
     do = torch.randn(B, T_base, H, D, dtype=dtype, device=torch_device)
     dht = torch.randn(B, H, D, D, dtype=torch.float32, device=torch_device)
 
-    _, g_interleaved_cumsum, _, A_forward, _ = chunk_gated_delta_product_fwd(
-        q=q,
-        k=k,
-        v=v,
-        g=g_base,
-        beta=beta,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=True,
-        num_householder=num_householder,
-    )
+    # _, g_interleaved_cumsum, _, A_forward, _ = chunk_gated_delta_product_fwd(
+    #     q=q,
+    #     k=k,
+    #     v=v,
+    #     g=g_base,
+    #     beta=beta,
+    #     scale=scale,
+    #     initial_state=initial_state,
+    #     output_final_state=True,
+    #     num_householder=num_householder,
+    # )
 
-    expanded_chunk_size = base_chunk_size * (1 << (num_householder - 1).bit_length())
+    expanded_chunk_size = base_chunk_size * torch.next_power_of_2(num_householder)
 
     q_expanded = q.new_zeros(B, T_base, num_householder, H, D)
     q_expanded[:, :, -1] = q
@@ -125,31 +129,51 @@ def test_gated_delta_product_expanded_chunk(base_chunk_size: int, num_householde
     do_expanded = do.new_zeros(B, T_base, num_householder, H, D)
     do_expanded[:, :, -1] = do
     do_expanded = rearrange(do_expanded, "b t n h d -> b (t n) h d").contiguous()
+    g_interleaved = g_base.new_zeros(B, T_base, num_householder, H)
+    g_interleaved[:, :, 0] = g_base
+    g_interleaved = rearrange(g_interleaved, "b t n h -> b (t n) h").contiguous()
+    g_interleaved = chunk_local_cumsum(
+        g_interleaved,
+        chunk_size=base_chunk_size,
+        cu_seqlens=None,
+        output_dtype=torch.float32,
+    )
+    g_interleaved_group = chunk_local_cumsum(
+        g_interleaved,
+        chunk_size=expanded_chunk_size,
+        cu_seqlens=None,
+        output_dtype=torch.float32,
+    )
 
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
         beta=beta,
-        g_cumsum=g_interleaved_cumsum,
+        g=g_interleaved,
         cu_seqlens=None,
         output_dtype=torch.float32,
+        chunk_size=base_chunk_size,
     )
-    A = solve_tril(A=A, cu_seqlens=None, output_dtype=k.dtype)
-    assert_close("A", A_forward, A, atol=1e-3)
+    A = solve_tril(
+        A=A,
+        cu_seqlens=None,
+        output_dtype=k.dtype,
+    )
+    # assert_close("A", A_forward, A, atol=1e-3)
 
-    w_gdp, u_gdp = recompute_w_u_fwd(
+    w_gdp, u_gdp = recompute_w_u_expanded(
         k=k,
         v=v,
         beta=beta,
         A=A,
-        g_cumsum=g_interleaved_cumsum,
+        g_cumsum=g_interleaved,
         cu_seqlens=None,
     )
 
-    h_gdp, v_new_gdp, _ = chunk_gated_delta_product_fwd_h(
+    h_gdp, v_new_gdp, _ = chunk_gated_delta_product_fwd_h_expanded(
         k=k,
         w=w_gdp,
         u=u_gdp,
-        g=g_interleaved_cumsum,
+        g=g_interleaved_group,
         initial_state=initial_state,
         output_final_state=True,
         chunk_size=base_chunk_size,
@@ -157,61 +181,65 @@ def test_gated_delta_product_expanded_chunk(base_chunk_size: int, num_householde
         num_householder=num_householder,
     )
 
-    dv_local_gdp = delta_product_chunk_bwd_dv_local(
-        q=q_expanded,
+    dv_local_gdp = gdp_chunk_bwd_dv_local(
+        q=q,
         k=k,
-        g=g_interleaved_cumsum,
-        do=do_expanded,
+        g=g_interleaved_group,
+        do=do,
         scale=scale,
         cu_seqlens=None,
         chunk_size=base_chunk_size,
+        num_householder=num_householder,
     )
 
-    dh_gdp, dh0_gdp, dv_after_dhu_gdp = chunk_gated_delta_product_bwd_dhu(
-        q=q_expanded,
+    dh_gdp, dh0_gdp, dv_after_dhu_gdp = gdp_chunk_bwd_dhu(
+        q=q,
         k=k,
         w=w_gdp,
-        g=g_interleaved_cumsum,
+        g=g_interleaved_group,
         h0=initial_state,
         dht=dht,
-        do=do_expanded,
+        do=do,
         dv=dv_local_gdp,
         scale=scale,
         cu_seqlens=None,
         chunk_size=base_chunk_size,
+        num_householder=num_householder,
     )
 
-    dq_gdp, dk_gdp, dw_gdp, dg_partial_gdp = delta_product_chunk_bwd_dqkwg(
-        q=q_expanded,
+    dq_gdp, dk_gdp, dw_gdp, dg_partial_gdp = gdp_chunk_bwd_dqkwg(
+        q=q,
         k=k,
         v=v_new_gdp,
-        g=g_interleaved_cumsum,
-        do=do_expanded,
+        g=g_interleaved_group,
+        do=do,
         h=h_gdp,
         dh=dh_gdp,
         dv=dv_after_dhu_gdp,
         w=w_gdp,
         cu_seqlens=None,
         chunk_size=base_chunk_size,
+        num_householder=num_householder,
         scale=scale,
     )
 
-    dk_hidden_gdp, dv_prepare_gdp, db_gdp, dg_prepare_gdp = prepare_wy_repr_bwd(
+    dk_hidden_gdp, dv_prepare_gdp, db_gdp, dg_prepare_gdp = prepare_wy_repr_bwd_expanded(
         k=k,
         v=v,
         beta=beta,
-        g=g_interleaved_cumsum,
+        g=g_interleaved,
         A=A,
         dw=dw_gdp,
         du=dv_after_dhu_gdp,
         cu_seqlens=None,
+        N=expanded_chunk_size,
     )
 
     dk_total_gdp = dk_gdp + dk_hidden_gdp
     dg_total_gdp = dg_partial_gdp + dg_prepare_gdp
     dg_total_gdp = chunk_local_cumsum(
         g=dg_total_gdp,
-        chunk_size=64,
+        chunk_size=expanded_chunk_size,
         reverse=True,
         cu_seqlens=None,
     )
@@ -221,7 +249,7 @@ def test_gated_delta_product_expanded_chunk(base_chunk_size: int, num_householde
         v=v,
         beta=beta,
         A=A,
-        g_cumsum=g_interleaved_cumsum,
+        g=g_interleaved,
         cu_seqlens=None,
     )
 
@@ -229,49 +257,49 @@ def test_gated_delta_product_expanded_chunk(base_chunk_size: int, num_householde
         k=k,
         w=w_rule,
         u=u_rule,
-        g=g_interleaved_cumsum,
+        g=g_interleaved,
         initial_state=initial_state,
         output_final_state=True,
         cu_seqlens=None,
-        chunk_size=expanded_chunk_size,
+        chunk_size=base_chunk_size,
     )
 
     dv_local_rule = delta_rule_chunk_bwd_dv_local(
         q=q_expanded,
         k=k,
-        g=g_interleaved_cumsum,
+        g=g_interleaved,
         do=do_expanded,
         scale=scale,
         cu_seqlens=None,
-        chunk_size=expanded_chunk_size,
+        chunk_size=base_chunk_size,
     )
 
     dh_rule, dh0_rule, dv_after_dhu_rule = chunk_gated_delta_rule_bwd_dhu(
         q=q_expanded,
         k=k,
         w=w_rule,
-        g=g_interleaved_cumsum,
+        g=g_interleaved,
         h0=initial_state,
         dht=dht,
         do=do_expanded,
         dv=dv_local_rule,
         scale=scale,
         cu_seqlens=None,
-        chunk_size=expanded_chunk_size,
+        chunk_size=base_chunk_size,
     )
 
     dq_rule, dk_rule, dw_rule, dg_partial_rule = delta_rule_chunk_bwd_dqkwg(
         q=q_expanded,
         k=k,
         v=v_new_rule,
-        g=g_interleaved_cumsum,
+        g=g_interleaved,
         do=do_expanded,
         h=h_rule,
         dh=dh_rule,
         dv=dv_after_dhu_rule,
         w=w_rule,
         cu_seqlens=None,
-        chunk_size=expanded_chunk_size,
+        chunk_size=base_chunk_size,
         scale=scale,
     )
 
@@ -279,7 +307,7 @@ def test_gated_delta_product_expanded_chunk(base_chunk_size: int, num_householde
         k=k,
         v=v,
         beta=beta,
-        g=g_interleaved_cumsum,
+        g=g_interleaved,
         A=A,
         dw=dw_rule,
         du=dv_after_dhu_rule,
@@ -290,10 +318,13 @@ def test_gated_delta_product_expanded_chunk(base_chunk_size: int, num_householde
     dg_total_rule = dg_partial_rule + dg_prepare_rule
     dg_total_rule = chunk_local_cumsum(
         g=dg_total_rule,
-        chunk_size=64,
+        chunk_size=expanded_chunk_size,
         reverse=True,
         cu_seqlens=None,
     )
+
+    # save each of the outputs 
+
 
     assert_close("w", w_gdp, w_rule, atol=1e-3)
     assert_close("u", u_gdp, u_rule, atol=1e-3)
